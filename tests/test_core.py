@@ -4,6 +4,7 @@ from polymarket_bot.gamma import flatten_markets
 from polymarket_bot.scoring import score_market
 from polymarket_bot.paper import decide_paper
 from polymarket_bot.data import score_wallet
+from polymarket_bot.book_archive import normalize_levels, bbo_from_levels, trade_id
 
 
 class CoreTests(unittest.TestCase):
@@ -33,6 +34,17 @@ class CoreTests(unittest.TestCase):
         scored = score_wallet(row, trades)
         self.assertGreaterEqual(scored["copy_score"], 80)
         self.assertIn("copyable average trade size", scored["reasons"])
+
+    def test_book_levels_top_three_and_bbo(self):
+        bids = normalize_levels([{"price": "0.40", "size": "10"}, {"price": "0.45", "size": "5"}, {"price": "0.39", "size": "7"}, {"price": "0.30", "size": "9"}], reverse=True)
+        asks = normalize_levels([{"price": "0.60", "size": "2"}, {"price": "0.55", "size": "4"}, {"price": "0.70", "size": "8"}], reverse=False)
+        self.assertEqual([x["price"] for x in bids], [0.45, 0.4, 0.39])
+        self.assertEqual([x["price"] for x in asks], [0.55, 0.6, 0.7])
+        self.assertEqual(bbo_from_levels(bids, asks)["spread"], 0.10000000000000003)
+
+    def test_trade_id_prefers_chain_identity(self):
+        self.assertEqual(trade_id({"transactionHash": "0xabc", "logIndex": 7, "id": "fallback"}), "0xabc:7")
+        self.assertEqual(trade_id({"transactionHash": "0xabc", "id": "fallback"}), "0xabc")
 
 
 if __name__ == "__main__":

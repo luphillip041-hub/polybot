@@ -49,6 +49,7 @@ def flatten_markets(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "event_slug": event.get("slug"),
                 "event_title": event.get("title") or event.get("question"),
                 "market_id": market.get("id"),
+                "condition_id": market.get("conditionId") or market.get("condition_id"),
                 "market_slug": market.get("slug"),
                 "question": market.get("question") or event.get("title"),
                 "active": market.get("active"),

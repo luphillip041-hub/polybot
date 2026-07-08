@@ -1,0 +1,22 @@
+# Polymarket Copybot book archive daemon
+# Paper/research only: public Gamma/Data/CLOB reads, no private keys, no orders.
+[Unit]
+Description=Polymarket Copybot Book Archive and Shadow Journal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/flip/projects/polymarket-copybot
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYMARKET_ARCHIVE_CONFIG=/root/flip/projects/polymarket-copybot/archive_config.json
+ExecStart=/usr/bin/python3 -m polymarket_bot.book_archive
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/root/flip/projects/polymarket-copybot/runs
+
+[Install]
+WantedBy=multi-user.target
