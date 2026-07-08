@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .archive_config import ArchiveConfig
 
-app = FastAPI(title="Polymarket Copybot Status API", version="0.1.0")
+app = FastAPI(title="Polymarket Copybot Status API", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
