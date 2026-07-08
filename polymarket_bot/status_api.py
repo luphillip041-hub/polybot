@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -358,7 +359,9 @@ def get_gaps(days: int = Query(7, ge=1, le=14)) -> list[dict[str, Any]]:
 def main() -> None:
     import uvicorn
 
-    uvicorn.run("polymarket_bot.status_api:app", host="127.0.0.1", port=8710, log_level="info")
+    host = os.getenv("POLYMARKET_STATUS_HOST", "127.0.0.1")
+    port = int(os.getenv("POLYMARKET_STATUS_PORT", "8710"))
+    uvicorn.run("polymarket_bot.status_api:app", host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":
