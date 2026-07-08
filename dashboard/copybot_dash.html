@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Copybot // Book Archive</title>
+  <style>
+    :root {
+      --bg: #050607;
+      --panel: #0b0e10;
+      --panel2: #101519;
+      --ink: #e8f7ee;
+      --muted: #7f9188;
+      --grid: #1f2a25;
+      --green: #46ff8f;
+      --cyan: #5be7ff;
+      --amber: #ffcc66;
+      --red: #ff5e6c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 20% 0%, rgba(70,255,143,.12), transparent 28rem),
+        radial-gradient(circle at 100% 20%, rgba(91,231,255,.10), transparent 30rem),
+        linear-gradient(180deg, #050607, #020303 70%);
+      color: var(--ink);
+      font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      letter-spacing: .02em;
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 28px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 22px; }
+    h1 { margin: 0; font-size: clamp(22px, 4vw, 42px); line-height: 1; letter-spacing: .08em; text-transform: uppercase; }
+    h1 span { color: var(--green); text-shadow: 0 0 18px rgba(70,255,143,.4); }
+    .clock { color: var(--muted); text-align: right; white-space: nowrap; }
+    .status-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+    .pill {
+      border: 1px solid var(--grid);
+      background: rgba(11,14,16,.82);
+      padding: 12px 14px;
+      display: flex; align-items: center; justify-content: space-between;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.02);
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); box-shadow: 0 0 12px currentColor; }
+    .dot.good { background: var(--green); }
+    .dot.warn { background: var(--amber); }
+    .grid { display: grid; grid-template-columns: 1.4fr .9fr; gap: 16px; }
+    .panel { border: 1px solid var(--grid); background: rgba(11,14,16,.88); padding: 18px; box-shadow: 0 18px 50px rgba(0,0,0,.28); }
+    .panel h2 { margin: 0 0 16px; font-size: 13px; color: var(--green); letter-spacing: .35em; text-transform: uppercase; }
+    .timeline { height: 108px; position: relative; border: 1px solid var(--grid); background: linear-gradient(90deg, rgba(70,255,143,.16), rgba(70,255,143,.08)); overflow: hidden; }
+    .timeline:before { content: ""; position: absolute; inset: 0; background: repeating-linear-gradient(90deg, transparent 0 8.2%, rgba(255,255,255,.05) 8.25% 8.35%); }
+    .gap { position: absolute; top: 0; bottom: 0; background: rgba(255,94,108,.55); box-shadow: 0 0 16px rgba(255,94,108,.45); }
+    .ticks { display:flex; justify-content:space-between; color:var(--muted); margin-top:8px; font-size:12px; }
+    .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px; }
+    .kpi { background: var(--panel2); border: 1px solid var(--grid); padding: 14px; min-height: 78px; }
+    .label { color: var(--muted); font-size: 11px; letter-spacing: .24em; text-transform: uppercase; }
+    .value { margin-top: 8px; font-size: 26px; color: var(--ink); }
+    .value.green { color: var(--green); } .value.cyan { color: var(--cyan); } .value.amber { color: var(--amber); }
+    .wallets { display: grid; gap: 10px; }
+    .wallet { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 12px; background: var(--panel2); border: 1px solid var(--grid); }
+    .wallet strong { color: var(--ink); }
+    .wallet small { color: var(--muted); display:block; margin-top: 4px; }
+    footer { margin-top: 18px; display:flex; justify-content:space-between; gap: 12px; color: var(--muted); font-size: 12px; text-transform: uppercase; }
+    @media (max-width: 820px) { .grid, .status-row, .kpis { grid-template-columns: 1fr; } header, footer { flex-direction: column; align-items:flex-start; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>▚▞ <span>Copybot</span> // Book Archive</h1>
+      <div class="clock"><div id="time">--:--:--</div><div>UTC</div></div>
+    </header>
+
+    <section class="status-row">
+      <div class="pill"><b>SERVICE</b><i id="serviceDot" class="dot"></i></div>
+      <div class="pill"><b>WEBSOCKET</b><i id="wsDot" class="dot"></i></div>
+      <div class="pill"><b>SHADOW</b><i id="shadowDot" class="dot warn"></i></div>
+    </section>
+
+    <main class="grid">
+      <section class="panel">
+        <h2>Coverage — Today (UTC)</h2>
+        <div class="timeline" id="timeline"></div>
+        <div class="ticks"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+        <div class="kpis">
+          <div class="kpi"><div class="label">Coverage</div><div class="value green" id="coverage">--%</div></div>
+          <div class="kpi"><div class="label">Gaps</div><div class="value amber" id="gaps">--</div></div>
+          <div class="kpi"><div class="label">Longest Gap</div><div class="value" id="longestGap">--</div></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Archiver</h2>
+        <div class="kpis" style="grid-template-columns:1fr 1fr">
+          <div class="kpi"><div class="label">Markets</div><div class="value" id="markets">--</div></div>
+          <div class="kpi"><div class="label">Tokens</div><div class="value" id="tokens">--</div></div>
+          <div class="kpi"><div class="label">Rows/Hr</div><div class="value cyan" id="rowsHr">--</div></div>
+          <div class="kpi"><div class="label">MB/Day</div><div class="value" id="mbDay">--</div></div>
+          <div class="kpi" style="grid-column:1/-1"><div class="label">Last WS Msg</div><div class="value amber" id="lastWs">--</div><small>seconds ago</small></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Shadow Journal</h2>
+        <div class="kpis">
+          <div class="kpi"><div class="label">Fills Today</div><div class="value green" id="fillsToday">--</div></div>
+          <div class="kpi"><div class="label">Followups Pend</div><div class="value amber" id="pending">--</div></div>
+          <div class="kpi"><div class="label">Completed</div><div class="value" id="completed">--</div></div>
+          <div class="kpi"><div class="label">Missed</div><div class="value" id="missed">--</div></div>
+          <div class="kpi" style="grid-column: span 2"><div class="label">Last Fill</div><div class="value" style="font-size:16px" id="lastFill">--</div></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Tracked Wallets</h2>
+        <div class="wallets" id="wallets"></div>
+      </section>
+    </main>
+
+    <footer>
+      <div>Read-only · Public data · No orders · No keys</div>
+      <div>Last update: <span id="updated">--</span></div>
+    </footer>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const fmt = (n, d=0) => Number(n ?? 0).toLocaleString(undefined, {maximumFractionDigits:d});
+    function setDot(id, ok, warn=false) { const el=$(id); el.className = 'dot ' + (ok ? 'good' : warn ? 'warn' : ''); }
+    function seconds(ts) { return Math.max(0, Math.floor((Date.now() - new Date(ts).getTime()) / 1000)); }
+    function drawGaps(gaps) {
+      const tl = $('timeline'); tl.innerHTML = '';
+      for (const g of gaps || []) {
+        const s = new Date(g.start_ts), e = new Date(g.end_ts);
+        const start = (s.getUTCHours()*3600 + s.getUTCMinutes()*60 + s.getUTCSeconds()) / 86400 * 100;
+        const width = Math.max(.25, (g.duration_s || 0) / 86400 * 100);
+        const div = document.createElement('div'); div.className='gap'; div.style.left=start+'%'; div.style.width=width+'%'; div.title=`${g.reason}: ${g.duration_s}s`;
+        tl.appendChild(div);
+      }
+    }
+    async function refresh() {
+      $('time').textContent = new Date().toISOString().slice(11,19);
+      try {
+        const r = await fetch('/api/status', {cache:'no-store'});
+        const s = await r.json();
+        setDot('serviceDot', s.archiver.service_active); setDot('wsDot', s.archiver.ws_connected, s.archiver.last_ws_message_age_s < 90); setDot('shadowDot', s.shadow.followups_pending === 0, true);
+        $('coverage').textContent = fmt(s.coverage_pct_today, 3) + '%';
+        $('gaps').textContent = (s.gaps_today || []).length;
+        $('longestGap').textContent = fmt(Math.max(0, ...(s.gaps_today || []).map(g => g.duration_s || 0)), 1) + 's';
+        drawGaps(s.gaps_today);
+        $('markets').textContent = fmt(s.archiver.markets); $('tokens').textContent = fmt(s.archiver.tokens); $('rowsHr').textContent = fmt(s.archiver.book_rows_this_hour); $('mbDay').textContent = fmt(s.archiver.mb_per_day, 2); $('lastWs').textContent = fmt(s.archiver.last_ws_message_age_s, 1);
+        $('fillsToday').textContent = fmt(s.shadow.fills_today); $('pending').textContent = fmt(s.shadow.followups_pending); $('completed').textContent = fmt(s.shadow.followups_completed_today); $('missed').textContent = fmt(s.shadow.followups_missed_today); $('lastFill').textContent = s.shadow.last_fill_ts || '--';
+        $('wallets').innerHTML = (s.wallets || []).map(w => `<div class="wallet"><div><strong>${w.name}</strong><small>${w.markets_touched_7d} markets · last ${w.last_fill_ts || 'never'}</small></div><div>${w.fills_today}/${w.fills_7d}</div></div>`).join('');
+        $('updated').textContent = s.generated_at;
+      } catch (e) { setDot('serviceDot', false); $('updated').textContent = 'error: ' + e.message; }
+    }
+    refresh(); setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
