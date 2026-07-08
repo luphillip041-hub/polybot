@@ -10,7 +10,7 @@ Type=simple
 WorkingDirectory=/root/flip/projects/polymarket-copybot
 Environment=PYTHONUNBUFFERED=1
 Environment=POLYMARKET_ARCHIVE_CONFIG=/root/flip/projects/polymarket-copybot/archive_config.json
-Environment=POLYMARKET_STATUS_HOST=0.0.0.0
+Environment=POLYMARKET_STATUS_HOST=127.0.0.1
 Environment=POLYMARKET_STATUS_PORT=8710
 ExecStart=/usr/bin/python3 -m polymarket_bot.status_api
 Restart=always

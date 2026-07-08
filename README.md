@@ -52,3 +52,28 @@ systemctl daemon-reload
 systemctl enable --now polymarket-copybot-book-archive.service
 journalctl -u polymarket-copybot-book-archive.service -f
 ```
+
+## Discord monitor
+
+The Discord monitor is read-only. It polls `http://127.0.0.1:8710/api/status` over loopback only, posts alerts/daily digest to one channel, and exposes only these slash commands: `/status`, `/wallets`, `/gaps`. It has no code path for orders, restarts, writes, or trading-desk imports.
+
+Create the secret file outside the repo:
+
+```bash
+install -d -m 700 /root/flip/secrets
+cat >/root/flip/secrets/copybot_discord.env <<'EOF'
+DISCORD_BOT_TOKEN=replace-me
+DISCORD_CHANNEL_ID=replace-me
+EOF
+chmod 600 /root/flip/secrets/copybot_discord.env
+```
+
+Install:
+
+```bash
+cp systemd/polymarket-copybot-status-api.service /etc/systemd/system/
+cp systemd/polymarket-copybot-discord-monitor.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl restart polymarket-copybot-status-api.service
+systemctl enable --now polymarket-copybot-discord-monitor.service
+```
