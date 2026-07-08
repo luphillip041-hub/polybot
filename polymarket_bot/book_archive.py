@@ -127,6 +127,8 @@ class BookArchiveDaemon:
         self.last_write_by_token: dict[str, float] = {}
         self.stats = ArchiveStats(started_at=iso_now())
         self.compressed_write_samples: deque[tuple[float, int]] = deque()
+        self.row_buffers: dict[str, list[str]] = {}
+        self.buffered_row_counts: dict[str, int] = {}
         self.state = self._load_state()
         self.followup_queue = self._load_followup_queue()
         self._mark_startup_missed_followups()
@@ -194,6 +196,7 @@ class BookArchiveDaemon:
             }
             self.append_row("shadow", row)
             self.stats.shadow_rows_written += 1
+        self.flush_prefix("shadow")
         if missed_by_fill:
             LOG.warning("marked missed followups fills=%s", len(missed_by_fill))
         self.followup_queue = remaining
@@ -218,20 +221,36 @@ class BookArchiveDaemon:
         self.stats.rolling_disk_bytes_per_day = int(total * 86400 / window_seconds)
         self.stats.retention_footprint_bytes = int(self.stats.rolling_disk_bytes_per_day * self.config.retention_days)
 
-    def append_row(self, prefix: str, row: dict[str, Any]) -> int:
-        path = self.archive_path(prefix)
+    def append_row(self, prefix: str, row: dict[str, Any], *, flush: bool = False) -> int:
         payload = json.dumps(row, separators=(",", ":"), sort_keys=True, default=str) + "\n"
+        self.row_buffers.setdefault(prefix, []).append(payload)
+        self.buffered_row_counts[prefix] = self.buffered_row_counts.get(prefix, 0) + 1
+        if flush or len(self.row_buffers[prefix]) >= 100:
+            return self.flush_prefix(prefix)
+        return 0
+
+    def flush_prefix(self, prefix: str) -> int:
+        rows = self.row_buffers.get(prefix) or []
+        if not rows:
+            return 0
+        path = self.archive_path(prefix)
+        payload = "".join(rows).encode("utf-8")
         before = path.stat().st_size if path.exists() else 0
-        # Append each row as its own gzip member. If the process dies mid-member,
-        # all prior members remain readable with gzip readers.
+        # Write one gzip member per batch. If the process dies mid-member,
+        # prior members remain readable; at worst we lose one batch (<=5s or <=100 rows).
         with path.open("ab") as f:
-            f.write(gzip.compress(payload.encode("utf-8"), compresslevel=6))
+            f.write(gzip.compress(payload, compresslevel=6))
             f.flush()
             os.fsync(f.fileno())
         after = path.stat().st_size
         delta = max(0, after - before)
+        self.row_buffers[prefix] = []
+        self.buffered_row_counts[prefix] = 0
         self._track_compressed_bytes(delta)
         return delta
+
+    def flush_all(self) -> int:
+        return sum(self.flush_prefix(prefix) for prefix in list(self.row_buffers))
 
     def discover_markets(self) -> None:
         events = active_events(limit=self.config.gamma_event_limit)
@@ -298,7 +317,7 @@ class BookArchiveDaemon:
             "tokens_affected": tokens_affected,
             "reason": reason,
         }
-        self.append_row("book", row)
+        self.append_row("book", row, flush=True)
         self.stats.gap_rows_written += 1
         LOG.warning("gap marker reason=%s tokens=%s start=%s end=%s", reason, len(tokens_affected), start_ts, end_ts)
         return row
@@ -432,6 +451,7 @@ class BookArchiveDaemon:
                         self.followup_queue.append({"due_ts": now + offset, "offset_seconds": offset, "wallet": wallet, "trade_id": tid, "trade": trade})
         self.state["seen_trade_ids"] = list(seen)
         self._process_due_followups()
+        self.flush_prefix("shadow")
         self._save_state()
         self._save_followup_queue()
 
@@ -472,8 +492,14 @@ class BookArchiveDaemon:
             except Exception:
                 LOG.exception("retention failed path=%s", path)
 
+    async def flush_loop(self) -> None:
+        while self.running:
+            await self._sleep(5)
+            self.flush_all()
+
     async def heartbeat_loop(self) -> None:
         while self.running:
+            self.flush_all()
             self.stats.last_heartbeat_at = iso_now()
             report = {
                 "ts": self.stats.last_heartbeat_at,
@@ -517,11 +543,15 @@ class BookArchiveDaemon:
                 loop.add_signal_handler(sig, self.stop)
             except NotImplementedError:
                 pass
-        await asyncio.gather(self.ws_loop(), self.snapshot_loop(), self.wallet_loop(), self.heartbeat_loop(), self.market_refresh_loop())
+        try:
+            await asyncio.gather(self.ws_loop(), self.snapshot_loop(), self.wallet_loop(), self.flush_loop(), self.heartbeat_loop(), self.market_refresh_loop())
+        finally:
+            self.flush_all()
 
     def stop(self) -> None:
         LOG.info("stopping")
         self.running = False
+        self.flush_all()
 
 
 def configure_logging() -> None:

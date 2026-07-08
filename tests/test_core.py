@@ -57,13 +57,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(ctx["fill_side"], "BUY")
         self.assertEqual(ctx["fill_size"], 12.5)
 
-    def test_append_row_uses_independent_gzip_members_and_hourly_paths(self):
+    def test_append_row_batches_single_gzip_member_and_hourly_paths(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             cfg = ArchiveConfig(archive_dir=root, state_path=root / "state.json", followup_queue_path=root / "followups.json")
             daemon = BookArchiveDaemon(cfg)
             daemon.append_row("book", {"type": "book", "n": 1})
             daemon.append_row("book", {"type": "book", "n": 2})
+            self.assertEqual(list(root.glob("book_*.jsonl.gz")), [])
+            daemon.flush_all()
             files = list(root.glob("book_*.jsonl.gz"))
             self.assertEqual(len(files), 1)
             self.assertRegex(files[0].name, r"book_\d{4}-\d{2}-\d{2}_\d{2}\.jsonl\.gz")
