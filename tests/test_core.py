@@ -10,6 +10,7 @@ from polymarket_bot.paper import decide_paper
 from polymarket_bot.data import score_wallet
 from polymarket_bot.book_archive import normalize_levels, bbo_from_levels, trade_id, trade_fill_context, BookArchiveDaemon
 from polymarket_bot.archive_config import ArchiveConfig
+from polymarket_bot.status_api import RollingState, duration_s
 
 
 class CoreTests(unittest.TestCase):
@@ -102,6 +103,34 @@ class CoreTests(unittest.TestCase):
             with gzip.open(next(root.glob("book_*.jsonl.gz")), "rt") as f:
                 persisted = json.loads(next(f))
             self.assertEqual(persisted["reason"], "unit_test")
+
+    def test_status_shape_helpers(self):
+        st = RollingState()
+        st.last_refresh = 10**12  # prevent filesystem refresh in unit test
+        st.heartbeat = {
+            "stats": {"markets_covered": 2, "tokens_covered": 4},
+            "disk_estimate": {"compressed_mb_per_day": 12.5, "retention_days": 45, "retention_gb": 0.56},
+            "pending_followups": 3,
+        }
+        now = __import__("polymarket_bot.status_api", fromlist=["utc_now"]).utc_now()
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        st.book_rows = [
+            {"type": "book", "source": "websocket", "ts": now.isoformat()},
+            {"type": "gap", "start_ts": today.isoformat(), "end_ts": (today.replace(minute=1)).isoformat(), "reason": "unit"},
+        ]
+        st.shadow_rows = [
+            {"type": "fill", "ts": now.isoformat(), "wallet": "0xw", "trade": {"name": "demo", "conditionId": "m1"}},
+            {"type": "followup_book", "ts": now.isoformat(), "wallet": "0xw", "fill_price": 0.5, "fill_side": "BUY"},
+            {"type": "followup_missed", "ts": now.isoformat(), "wallet": "0xw"},
+        ]
+        out = st.status()
+        self.assertEqual(set(out.keys()), {"generated_at", "archiver", "gaps_today", "coverage_pct_today", "shadow", "wallets"})
+        self.assertEqual(set(out["archiver"].keys()), {"service_active", "ws_connected", "last_ws_message_age_s", "markets", "tokens", "book_rows_this_hour", "mb_per_day", "retention_days", "retention_gb"})
+        self.assertEqual(out["shadow"]["fills_today"], 1)
+        self.assertEqual(out["shadow"]["followups_completed_today"], 1)
+        self.assertEqual(out["shadow"]["followups_missed_today"], 1)
+        self.assertEqual(out["wallets"][0]["name"], "demo")
+        self.assertEqual(duration_s(today.isoformat(), (today.replace(minute=1)).isoformat()), 60.0)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,21 @@
+# Polymarket Copybot read-only status API
+# Loopback-only; GET endpoints only; no keys, no orders, no controls.
+[Unit]
+Description=Polymarket Copybot Read-Only Status API
+After=network-online.target polymarket-copybot-book-archive.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/flip/projects/polymarket-copybot
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYMARKET_ARCHIVE_CONFIG=/root/flip/projects/polymarket-copybot/archive_config.json
+ExecStart=/usr/bin/python3 -m polymarket_bot.status_api
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
