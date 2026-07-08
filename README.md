@@ -36,10 +36,11 @@ Artifacts are written under `runs/`.
 
 Config lives in `archive_config.json` and defaults to the top 50 active, CLOB-enabled markets ranked by liquidity/24h volume. Runtime artifacts are isolated under `runs/book_archive/`:
 
-- `book_YYYY-MM-DD.jsonl.gz` — compressed public book snapshots with timestamp, market/token metadata, best bid/ask, size, spread, and top 3 bid/ask levels.
-- `shadow_YYYY-MM-DD.jsonl.gz` — tracked-wallet fills in archived markets plus follow-up book states at 1/5/15 minutes.
+- `book_YYYY-MM-DD_HH.jsonl.gz` — hourly-rotated compressed public book snapshots/gap markers with timestamp, market/token metadata, best bid/ask, size, spread, and top 3 bid/ask levels.
+- `shadow_YYYY-MM-DD_HH.jsonl.gz` — tracked-wallet fills plus follow-up book states at 1/5/15 minutes, with fill price/side denormalized on follow-up rows.
+- `followup_queue.json` — crash/restart-persistent pending 1/5/15 minute followups; missed downtime windows are written as `followup_missed` rows.
 - `markets_latest.json` — currently covered markets/tokens.
-- `heartbeat_latest.json` — daemon heartbeat, coverage, row counters, wallet matches, and estimated daily disk usage.
+- `heartbeat_latest.json` — daemon heartbeat, coverage, row counters, wallet matches, rolling 1h compressed MB/day estimate, and 45-day retention footprint.
 
 The daemon is research/paper only: it uses public Gamma/Data/CLOB endpoints, does not load keys, and has no order-submission code path.
 

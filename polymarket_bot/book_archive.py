@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -83,6 +84,16 @@ def trade_id(trade: dict[str, Any]) -> str:
     return json.dumps(trade, sort_keys=True, default=str)[:512]
 
 
+def trade_fill_context(trade: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "fill_price": _num(trade.get("price")),
+        "fill_side": trade.get("side"),
+        "fill_size": _num(trade.get("size")),
+        "fill_timestamp": trade.get("timestamp"),
+        "fill_outcome": trade.get("outcome"),
+    }
+
+
 def token_ids_for_market(market: dict[str, Any]) -> list[str]:
     return [str(x) for x in (market.get("clob_token_ids") or []) if x not in (None, "")]
 
@@ -94,12 +105,15 @@ class ArchiveStats:
     book_rows_written: int = 0
     ws_messages: int = 0
     rest_snapshots: int = 0
+    gap_rows_written: int = 0
     wallet_trades_seen: int = 0
     wallet_trades_matched: int = 0
     shadow_rows_written: int = 0
     started_at: str = ""
     last_heartbeat_at: str = ""
-    daily_disk_bytes_estimate: int = 0
+    rolling_disk_bytes_per_day: int = 0
+    retention_footprint_bytes: int = 0
+    rolling_window_seconds: int = 3600
 
 
 class BookArchiveDaemon:
@@ -112,7 +126,10 @@ class BookArchiveDaemon:
         self.running = True
         self.last_write_by_token: dict[str, float] = {}
         self.stats = ArchiveStats(started_at=iso_now())
+        self.compressed_write_samples: deque[tuple[float, int]] = deque()
         self.state = self._load_state()
+        self.followup_queue = self._load_followup_queue()
+        self._mark_startup_missed_followups()
 
     def _load_state(self) -> dict[str, Any]:
         path = self.config.state_path
@@ -120,31 +137,101 @@ class BookArchiveDaemon:
             try:
                 data = json.loads(path.read_text())
                 data.setdefault("seen_trade_ids", [])
-                data.setdefault("pending_observations", [])
                 return data
             except Exception:
                 LOG.exception("failed to load state; starting fresh")
-        return {"seen_trade_ids": [], "pending_observations": []}
+        return {"seen_trade_ids": []}
 
     def _save_state(self) -> None:
         seen = list(dict.fromkeys(self.state.get("seen_trade_ids", [])))[-10000:]
-        pending = self.state.get("pending_observations", [])[-10000:]
-        self.state = {"seen_trade_ids": seen, "pending_observations": pending}
+        self.state = {"seen_trade_ids": seen}
         self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.config.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=2, sort_keys=True))
         tmp.replace(self.config.state_path)
 
-    def daily_path(self, prefix: str, day: datetime | None = None) -> Path:
-        d = (day or utc_now()).strftime("%Y-%m-%d")
+    def _load_followup_queue(self) -> list[dict[str, Any]]:
+        path = self.config.followup_queue_path
+        if path.exists():
+            try:
+                data = json.loads(path.read_text())
+                return data if isinstance(data, list) else []
+            except Exception:
+                LOG.exception("failed to load followup queue; starting empty")
+        # One-time migration from old combined state.
+        old_pending = self.state.get("pending_observations", [])
+        return old_pending if isinstance(old_pending, list) else []
+
+    def _save_followup_queue(self) -> None:
+        self.config.followup_queue_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.config.followup_queue_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.followup_queue[-10000:], indent=2, sort_keys=True, default=str))
+        tmp.replace(self.config.followup_queue_path)
+
+    def _mark_startup_missed_followups(self) -> None:
+        if not self.followup_queue:
+            return
+        now = time.time()
+        remaining: list[dict[str, Any]] = []
+        missed_by_fill: dict[str, dict[str, Any]] = {}
+        for item in self.followup_queue:
+            if float(item.get("due_ts") or 0) <= now:
+                fid = str(item.get("trade_id"))
+                bucket = missed_by_fill.setdefault(fid, {"offsets_missed": [], "wallet": item.get("wallet"), "trade": item.get("trade") or {}})
+                bucket["offsets_missed"].append(item.get("offset_seconds"))
+            else:
+                remaining.append(item)
+        for fid, bucket in missed_by_fill.items():
+            row = {
+                "ts": iso_now(),
+                "type": "followup_missed",
+                "kind": "followup_missed",
+                "fill_id": fid,
+                "trade_id": fid,
+                "wallet": bucket.get("wallet"),
+                "offsets_missed": sorted(bucket.get("offsets_missed") or []),
+                **trade_fill_context(bucket.get("trade") or {}),
+            }
+            self.append_row("shadow", row)
+            self.stats.shadow_rows_written += 1
+        if missed_by_fill:
+            LOG.warning("marked missed followups fills=%s", len(missed_by_fill))
+        self.followup_queue = remaining
+        self._save_followup_queue()
+
+    def archive_path(self, prefix: str, day: datetime | None = None) -> Path:
+        # Hourly rotation bounds crash-loss blast radius and makes file reads cheap.
+        d = (day or utc_now()).strftime("%Y-%m-%d_%H")
         return self.config.archive_dir / f"{prefix}_{d}.jsonl.gz"
 
+    def _track_compressed_bytes(self, delta: int) -> None:
+        if delta <= 0:
+            return
+        now = time.time()
+        self.compressed_write_samples.append((now, delta))
+        cutoff = now - 3600
+        while self.compressed_write_samples and self.compressed_write_samples[0][0] < cutoff:
+            self.compressed_write_samples.popleft()
+        window_seconds = max(1.0, min(3600.0, now - self.compressed_write_samples[0][0] if self.compressed_write_samples else 1.0))
+        total = sum(b for _, b in self.compressed_write_samples)
+        self.stats.rolling_window_seconds = int(window_seconds)
+        self.stats.rolling_disk_bytes_per_day = int(total * 86400 / window_seconds)
+        self.stats.retention_footprint_bytes = int(self.stats.rolling_disk_bytes_per_day * self.config.retention_days)
+
     def append_row(self, prefix: str, row: dict[str, Any]) -> int:
-        path = self.daily_path(prefix)
+        path = self.archive_path(prefix)
         payload = json.dumps(row, separators=(",", ":"), sort_keys=True, default=str) + "\n"
-        with gzip.open(path, "at", encoding="utf-8") as f:
-            f.write(payload)
-        return len(payload.encode("utf-8"))
+        before = path.stat().st_size if path.exists() else 0
+        # Append each row as its own gzip member. If the process dies mid-member,
+        # all prior members remain readable with gzip readers.
+        with path.open("ab") as f:
+            f.write(gzip.compress(payload.encode("utf-8"), compresslevel=6))
+            f.flush()
+            os.fsync(f.fileno())
+        after = path.stat().st_size
+        delta = max(0, after - before)
+        self._track_compressed_bytes(delta)
+        return delta
 
     def discover_markets(self) -> None:
         events = active_events(limit=self.config.gamma_event_limit)
@@ -188,6 +275,7 @@ class BookArchiveDaemon:
         ask_rows = normalize_levels(asks, reverse=False)
         row = {
             "ts": iso_now(),
+            "type": "book",
             "source": source,
             "event_type": event_type,
             "token_id": token_id,
@@ -198,9 +286,22 @@ class BookArchiveDaemon:
         }
         self.book_state[token_id] = row
         self.last_write_by_token[token_id] = now
-        size = self.append_row("book", row)
+        self.append_row("book", row)
         self.stats.book_rows_written += 1
-        self.stats.daily_disk_bytes_estimate = int(self.stats.book_rows_written * size * 86400 / max(1, now - datetime.fromisoformat(self.stats.started_at).timestamp()))
+
+    def record_gap(self, start_ts: str, end_ts: str, tokens_affected: list[str], reason: str) -> dict[str, Any]:
+        row = {
+            "ts": end_ts,
+            "type": "gap",
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "tokens_affected": tokens_affected,
+            "reason": reason,
+        }
+        self.append_row("book", row)
+        self.stats.gap_rows_written += 1
+        LOG.warning("gap marker reason=%s tokens=%s start=%s end=%s", reason, len(tokens_affected), start_ts, end_ts)
+        return row
 
     def rest_snapshot_once(self) -> None:
         for token_id in list(self.token_meta):
@@ -232,13 +333,17 @@ class BookArchiveDaemon:
                 self.record_book(token_id, bids if bids is not None else prior.get("top3_bids", []), asks if asks is not None else prior.get("top3_asks", []), source="websocket", event_type=str(event_type) if event_type else None)
 
     async def ws_loop(self) -> None:
+        last_disconnect_ts: str | None = None
         while self.running:
             tokens = list(self.token_meta)
             if not tokens:
-                await asyncio.sleep(5)
+                await self._sleep(5)
                 continue
             try:
                 async with websockets.connect(WS_MARKET_URL, ping_interval=20, open_timeout=20) as ws:
+                    if last_disconnect_ts:
+                        self.record_gap(last_disconnect_ts, iso_now(), tokens, "websocket_reconnect")
+                        last_disconnect_ts = None
                     await ws.send(json.dumps({"assets_ids": tokens, "type": "market", "custom_feature_enabled": True}))
                     LOG.info("websocket subscribed tokens=%s", len(tokens))
                     while self.running:
@@ -248,9 +353,11 @@ class BookArchiveDaemon:
                         self.handle_ws_message(raw)
             except asyncio.TimeoutError:
                 LOG.warning("websocket timeout; reconnecting")
+                last_disconnect_ts = last_disconnect_ts or iso_now()
             except Exception:
                 LOG.exception("websocket loop failed; reconnecting")
-                await asyncio.sleep(10)
+                last_disconnect_ts = last_disconnect_ts or iso_now()
+                await self._sleep(5)
 
     async def _sleep(self, seconds: float) -> None:
         deadline = time.time() + seconds
@@ -296,14 +403,12 @@ class BookArchiveDaemon:
         token = self._trade_token(trade)
         if token:
             return self.book_state.get(token)
-        # If only conditionId is present, return all archived token books for that market-ish context.
         slug = trade.get("marketSlug") or trade.get("slug")
-        candidates = [state for tid, state in self.book_state.items() if not slug or state.get("market", {}).get("market_slug") == slug]
+        candidates = [state for _tid, state in self.book_state.items() if not slug or state.get("market", {}).get("market_slug") == slug]
         return {"tokens": candidates, "ts": iso_now()} if candidates else None
 
     def poll_wallets_once(self) -> None:
         seen: set[str] = set(self.state.get("seen_trade_ids", []))
-        pending: list[dict[str, Any]] = self.state.get("pending_observations", [])
         for wallet in self._configured_wallets():
             try:
                 trades = user_trades(wallet, self.config.trade_poll_limit)
@@ -319,36 +424,38 @@ class BookArchiveDaemon:
                 matched = self._trade_matches_archive(trade)
                 if matched:
                     self.stats.wallet_trades_matched += 1
-                    row = {"ts": iso_now(), "kind": "fill", "wallet": wallet, "trade_id": tid, "trade": trade, "book_at_detection": self._current_book_for_trade(trade)}
+                    row = {"ts": iso_now(), "type": "fill", "kind": "fill", "wallet": wallet, "trade_id": tid, "trade": trade, "book_at_detection": self._current_book_for_trade(trade), **trade_fill_context(trade)}
                     self.append_row("shadow", row)
                     self.stats.shadow_rows_written += 1
                     now = time.time()
                     for offset in self.config.followup_offsets_seconds:
-                        pending.append({"due_ts": now + offset, "offset_seconds": offset, "wallet": wallet, "trade_id": tid, "trade": trade})
+                        self.followup_queue.append({"due_ts": now + offset, "offset_seconds": offset, "wallet": wallet, "trade_id": tid, "trade": trade})
         self.state["seen_trade_ids"] = list(seen)
-        self.state["pending_observations"] = pending
         self._process_due_followups()
         self._save_state()
+        self._save_followup_queue()
 
     def _process_due_followups(self) -> None:
         now = time.time()
         remaining: list[dict[str, Any]] = []
-        for item in self.state.get("pending_observations", []):
+        for item in self.followup_queue:
             if float(item.get("due_ts") or 0) > now:
                 remaining.append(item)
                 continue
             trade = item.get("trade") or {}
             row = {
                 "ts": iso_now(),
+                "type": "followup_book",
                 "kind": "followup_book",
                 "wallet": item.get("wallet"),
                 "trade_id": item.get("trade_id"),
                 "offset_seconds": item.get("offset_seconds"),
                 "book": self._current_book_for_trade(trade),
+                **trade_fill_context(trade),
             }
             self.append_row("shadow", row)
             self.stats.shadow_rows_written += 1
-        self.state["pending_observations"] = remaining
+        self.followup_queue = remaining
 
     async def wallet_loop(self) -> None:
         while self.running:
@@ -372,15 +479,25 @@ class BookArchiveDaemon:
                 "ts": self.stats.last_heartbeat_at,
                 "config": self.config.to_jsonable(),
                 "stats": self.stats.__dict__,
+                "disk_estimate": {
+                    "rolling_window_seconds": self.stats.rolling_window_seconds,
+                    "compressed_bytes_per_day": self.stats.rolling_disk_bytes_per_day,
+                    "compressed_mb_per_day": round(self.stats.rolling_disk_bytes_per_day / 1_000_000, 3),
+                    "retention_days": self.config.retention_days,
+                    "retention_bytes": self.stats.retention_footprint_bytes,
+                    "retention_gb": round(self.stats.retention_footprint_bytes / 1_000_000_000, 3),
+                },
                 "wallets_tracked": len(self._configured_wallets()),
-                "pending_followups": len(self.state.get("pending_observations", [])),
+                "pending_followups": len(self.followup_queue),
                 "archive_dir": str(self.config.archive_dir),
             }
             write_json(self.config.archive_dir / "heartbeat_latest.json", report)
-            LOG.info("heartbeat markets=%s tokens=%s book_rows=%s ws=%s wallet_seen=%s matched=%s shadow_rows=%s est_daily_mb=%.2f",
-                     self.stats.markets_covered, self.stats.tokens_covered, self.stats.book_rows_written, self.stats.ws_messages,
-                     self.stats.wallet_trades_seen, self.stats.wallet_trades_matched, self.stats.shadow_rows_written,
-                     self.stats.daily_disk_bytes_estimate / 1_000_000)
+            LOG.info(
+                "heartbeat markets=%s tokens=%s book_rows=%s gaps=%s ws=%s wallet_seen=%s matched=%s shadow_rows=%s compressed_mb_day=%.3f retention_gb=%.3f",
+                self.stats.markets_covered, self.stats.tokens_covered, self.stats.book_rows_written, self.stats.gap_rows_written,
+                self.stats.ws_messages, self.stats.wallet_trades_seen, self.stats.wallet_trades_matched, self.stats.shadow_rows_written,
+                self.stats.rolling_disk_bytes_per_day / 1_000_000, self.stats.retention_footprint_bytes / 1_000_000_000,
+            )
             await self._sleep(self.config.heartbeat_interval_seconds)
 
     async def market_refresh_loop(self) -> None:

@@ -1,10 +1,15 @@
 import unittest
+import gzip
+import json
+import tempfile
+from pathlib import Path
 
 from polymarket_bot.gamma import flatten_markets
 from polymarket_bot.scoring import score_market
 from polymarket_bot.paper import decide_paper
 from polymarket_bot.data import score_wallet
-from polymarket_bot.book_archive import normalize_levels, bbo_from_levels, trade_id
+from polymarket_bot.book_archive import normalize_levels, bbo_from_levels, trade_id, trade_fill_context, BookArchiveDaemon
+from polymarket_bot.archive_config import ArchiveConfig
 
 
 class CoreTests(unittest.TestCase):
@@ -45,6 +50,56 @@ class CoreTests(unittest.TestCase):
     def test_trade_id_prefers_chain_identity(self):
         self.assertEqual(trade_id({"transactionHash": "0xabc", "logIndex": 7, "id": "fallback"}), "0xabc:7")
         self.assertEqual(trade_id({"transactionHash": "0xabc", "id": "fallback"}), "0xabc")
+
+    def test_fill_context_is_denormalized_for_followups(self):
+        ctx = trade_fill_context({"price": "0.42", "side": "BUY", "size": "12.5", "timestamp": 123, "outcome": "Yes"})
+        self.assertEqual(ctx["fill_price"], 0.42)
+        self.assertEqual(ctx["fill_side"], "BUY")
+        self.assertEqual(ctx["fill_size"], 12.5)
+
+    def test_append_row_uses_independent_gzip_members_and_hourly_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = ArchiveConfig(archive_dir=root, state_path=root / "state.json", followup_queue_path=root / "followups.json")
+            daemon = BookArchiveDaemon(cfg)
+            daemon.append_row("book", {"type": "book", "n": 1})
+            daemon.append_row("book", {"type": "book", "n": 2})
+            files = list(root.glob("book_*.jsonl.gz"))
+            self.assertEqual(len(files), 1)
+            self.assertRegex(files[0].name, r"book_\d{4}-\d{2}-\d{2}_\d{2}\.jsonl\.gz")
+            with gzip.open(files[0], "rt") as f:
+                rows = [json.loads(line) for line in f]
+            self.assertEqual([r["n"] for r in rows], [1, 2])
+            self.assertGreater(daemon.stats.rolling_disk_bytes_per_day, 0)
+            self.assertEqual(daemon.stats.retention_footprint_bytes, daemon.stats.rolling_disk_bytes_per_day * cfg.retention_days)
+
+    def test_startup_missed_followups_written_and_queue_persisted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            q = root / "followups.json"
+            q.write_text(json.dumps([{"due_ts": 1, "offset_seconds": 60, "wallet": "0xw", "trade_id": "fill1", "trade": {"price": 0.5, "side": "SELL"}}]))
+            cfg = ArchiveConfig(archive_dir=root, state_path=root / "state.json", followup_queue_path=q)
+            BookArchiveDaemon(cfg)
+            shadows = list(root.glob("shadow_*.jsonl.gz"))
+            self.assertEqual(len(shadows), 1)
+            with gzip.open(shadows[0], "rt") as f:
+                row = json.loads(next(f))
+            self.assertEqual(row["type"], "followup_missed")
+            self.assertEqual(row["offsets_missed"], [60])
+            self.assertEqual(row["fill_price"], 0.5)
+            self.assertEqual(json.loads(q.read_text()), [])
+
+    def test_gap_marker_schema(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = ArchiveConfig(archive_dir=root, state_path=root / "state.json", followup_queue_path=root / "followups.json")
+            daemon = BookArchiveDaemon(cfg)
+            row = daemon.record_gap("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:05+00:00", ["t1", "t2"], "unit_test")
+            self.assertEqual(row["type"], "gap")
+            self.assertEqual(row["tokens_affected"], ["t1", "t2"])
+            with gzip.open(next(root.glob("book_*.jsonl.gz")), "rt") as f:
+                persisted = json.loads(next(f))
+            self.assertEqual(persisted["reason"], "unit_test")
 
 
 if __name__ == "__main__":

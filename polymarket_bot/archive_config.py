@@ -25,6 +25,7 @@ class ArchiveConfig:
     heartbeat_interval_seconds: int = 60
     archive_dir: Path = CONFIG.runs_dir / "book_archive"
     state_path: Path = CONFIG.runs_dir / "shadow_journal_state.json"
+    followup_queue_path: Path = CONFIG.runs_dir / "book_archive" / "followup_queue.json"
     user_agent: str = CONFIG.user_agent
 
     @classmethod
@@ -35,10 +36,9 @@ class ArchiveConfig:
         raw = json.loads(cfg_path.read_text())
         allowed = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         vals: dict[str, Any] = {k: v for k, v in raw.items() if k in allowed}
-        if "archive_dir" in vals:
-            vals["archive_dir"] = Path(vals["archive_dir"])
-        if "state_path" in vals:
-            vals["state_path"] = Path(vals["state_path"])
+        for key in ("archive_dir", "state_path", "followup_queue_path"):
+            if key in vals:
+                vals[key] = Path(vals[key])
         if "followup_offsets_seconds" in vals:
             vals["followup_offsets_seconds"] = tuple(int(x) for x in vals["followup_offsets_seconds"])
         return cls(**vals)
@@ -47,5 +47,6 @@ class ArchiveConfig:
         out = asdict(self)
         out["archive_dir"] = str(self.archive_dir)
         out["state_path"] = str(self.state_path)
+        out["followup_queue_path"] = str(self.followup_queue_path)
         out["followup_offsets_seconds"] = list(self.followup_offsets_seconds)
         return out
