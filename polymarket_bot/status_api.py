@@ -10,10 +10,17 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 from .archive_config import ArchiveConfig
 
 app = FastAPI(title="Polymarket Copybot Status API", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 CONFIG = ArchiveConfig.load()
 ARCHIVE_DIR = CONFIG.archive_dir
 SERVICE_NAME = "polymarket-copybot-book-archive.service"
@@ -77,6 +84,34 @@ def read_json(path: Path) -> Any:
         return json.loads(path.read_text())
     except Exception:
         return None
+
+
+def configured_wallets() -> list[dict[str, str]]:
+    wallets: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(address: Any, name: Any = None) -> None:
+        if not address:
+            return
+        wallet = str(address).lower()
+        if wallet in seen:
+            return
+        seen.add(wallet)
+        wallets.append({"wallet": wallet, "name": str(name or wallet)})
+
+    for wallet in CONFIG.tracked_wallets:
+        add(wallet)
+
+    scores_path = CONFIG.archive_dir.parent / "wallet_scores_latest.json"
+    rows = read_json(scores_path)
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            add(row.get("wallet"), row.get("user_name") or row.get("name") or row.get("pseudonym"))
+            if len(wallets) >= CONFIG.tracked_wallet_limit_from_scores:
+                break
+    return wallets
 
 
 def iter_gzip_jsonl(path: Path, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
@@ -252,15 +287,20 @@ class RollingState:
         today_start, today_end = day_bounds(0)
         week_start = now - timedelta(days=7)
         by_wallet: dict[str, dict[str, Any]] = {}
+        for configured in configured_wallets():
+            wallet = configured["wallet"]
+            by_wallet[wallet] = {"name": configured["name"], "fills_today": 0, "fills_7d": 0, "last_fill_ts": None, "markets": set()}
         for r in self.shadow_rows:
             if (r.get("type") or r.get("kind")) != "fill":
                 continue
             ts = parse_ts(r.get("ts") or r.get("fill_timestamp"))
             if not ts or ts < week_start:
                 continue
-            wallet = str(r.get("wallet") or r.get("trade", {}).get("proxyWallet") or "unknown")
             trade = r.get("trade") if isinstance(r.get("trade"), dict) else {}
+            wallet = str(r.get("wallet") or trade.get("proxyWallet") or "unknown").lower()
             bucket = by_wallet.setdefault(wallet, {"name": trade.get("name") or trade.get("pseudonym") or wallet, "fills_today": 0, "fills_7d": 0, "last_fill_ts": None, "markets": set()})
+            if bucket["name"] == wallet and (trade.get("name") or trade.get("pseudonym")):
+                bucket["name"] = trade.get("name") or trade.get("pseudonym")
             bucket["fills_7d"] += 1
             if today_start <= ts < today_end:
                 bucket["fills_today"] += 1
@@ -279,7 +319,7 @@ class RollingState:
                 "last_fill_ts": last.isoformat(timespec="seconds") if last else None,
                 "markets_touched_7d": int(len(bucket["markets"])),
             })
-        rows.sort(key=lambda x: (x["fills_7d"], x["fills_today"], x["last_fill_ts"] or ""), reverse=True)
+        rows.sort(key=lambda x: (x["fills_7d"], x["fills_today"], x["last_fill_ts"] or "", x["name"]), reverse=True)
         return rows
 
 
