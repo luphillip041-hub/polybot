@@ -131,6 +131,8 @@ class BookArchiveDaemon:
         self.buffered_row_counts: dict[str, int] = {}
         self.state = self._load_state()
         self.followup_queue = self._load_followup_queue()
+        self.last_ws_message_ts: str | None = None
+        self.ws_stale_timeout_seconds = float(os.getenv("POLYMARKET_WS_STALE_TIMEOUT_SECONDS", "60"))
         self._mark_startup_missed_followups()
 
     def _load_state(self) -> dict[str, Any]:
@@ -139,14 +141,32 @@ class BookArchiveDaemon:
             try:
                 data = json.loads(path.read_text())
                 data.setdefault("seen_trade_ids", [])
+                data.setdefault("journaled_trade_ids", self._load_journaled_trade_ids())
                 return data
             except Exception:
                 LOG.exception("failed to load state; starting fresh")
-        return {"seen_trade_ids": []}
+        return {"seen_trade_ids": [], "journaled_trade_ids": self._load_journaled_trade_ids()}
+
+    def _load_journaled_trade_ids(self) -> list[str]:
+        ids: list[str] = []
+        try:
+            for path in sorted(self.config.archive_dir.glob("shadow_*.jsonl.gz")):
+                with gzip.open(path, "rt") as f:
+                    for line in f:
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        if (row.get("type") or row.get("kind")) == "fill" and row.get("trade_id"):
+                            ids.append(str(row["trade_id"]))
+        except Exception:
+            LOG.exception("failed to load journaled shadow trade ids")
+        return list(dict.fromkeys(ids))[-10000:]
 
     def _save_state(self) -> None:
         seen = list(dict.fromkeys(self.state.get("seen_trade_ids", [])))[-10000:]
-        self.state = {"seen_trade_ids": seen}
+        journaled = list(dict.fromkeys(self.state.get("journaled_trade_ids", [])))[-10000:]
+        self.state = {"seen_trade_ids": seen, "journaled_trade_ids": journaled}
         self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.config.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=2, sort_keys=True))
@@ -315,6 +335,7 @@ class BookArchiveDaemon:
             "start_ts": start_ts,
             "end_ts": end_ts,
             "tokens_affected": tokens_affected,
+            "tokens_affected_count": len(tokens_affected),
             "reason": reason,
         }
         self.append_row("book", row, flush=True)
@@ -333,6 +354,7 @@ class BookArchiveDaemon:
 
     def handle_ws_message(self, raw: str) -> None:
         self.stats.ws_messages += 1
+        self.last_ws_message_ts = iso_now()
         try:
             msg = json.loads(raw)
         except Exception:
@@ -363,16 +385,21 @@ class BookArchiveDaemon:
                     if last_disconnect_ts:
                         self.record_gap(last_disconnect_ts, iso_now(), tokens, "websocket_reconnect")
                         last_disconnect_ts = None
+                    connect_ts = iso_now()
+                    self.last_ws_message_ts = self.last_ws_message_ts or connect_ts
                     await ws.send(json.dumps({"assets_ids": tokens, "type": "market", "custom_feature_enabled": True}))
                     LOG.info("websocket subscribed tokens=%s", len(tokens))
                     while self.running:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=max(30, self.config.snapshot_interval_seconds * 2))
+                        raw = await asyncio.wait_for(ws.recv(), timeout=self.ws_stale_timeout_seconds)
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8", "ignore")
                         self.handle_ws_message(raw)
             except asyncio.TimeoutError:
-                LOG.warning("websocket timeout; reconnecting")
-                last_disconnect_ts = last_disconnect_ts or iso_now()
+                end_ts = iso_now()
+                start_ts = self.last_ws_message_ts or last_disconnect_ts or end_ts
+                self.record_gap(start_ts, end_ts, list(self.token_meta), "ws_stale")
+                LOG.warning("websocket stale for %.1fs; reconnecting/resubscribing", self.ws_stale_timeout_seconds)
+                last_disconnect_ts = None
             except Exception:
                 LOG.exception("websocket loop failed; reconnecting")
                 last_disconnect_ts = last_disconnect_ts or iso_now()
@@ -426,8 +453,35 @@ class BookArchiveDaemon:
         candidates = [state for _tid, state in self.book_state.items() if not slug or state.get("market", {}).get("market_slug") == slug]
         return {"tokens": candidates, "ts": iso_now()} if candidates else None
 
+    def _trade_timestamp(self, trade: dict[str, Any]) -> float | None:
+        raw = trade.get("timestamp") or trade.get("createdAt") or trade.get("created_at")
+        try:
+            if isinstance(raw, (int, float)):
+                return float(raw)
+            if isinstance(raw, str):
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                return dt.timestamp()
+        except Exception:
+            return None
+        return None
+
+    def _mark_followups_missed_for_trade(self, wallet: str, tid: str, trade: dict[str, Any], offsets: list[int]) -> None:
+        row = {
+            "ts": iso_now(),
+            "type": "followup_missed",
+            "kind": "followup_missed",
+            "fill_id": tid,
+            "trade_id": tid,
+            "wallet": wallet,
+            "offsets_missed": sorted(offsets),
+            **trade_fill_context(trade),
+        }
+        self.append_row("shadow", row)
+        self.stats.shadow_rows_written += 1
+
     def poll_wallets_once(self) -> None:
         seen: set[str] = set(self.state.get("seen_trade_ids", []))
+        journaled: set[str] = set(self.state.get("journaled_trade_ids", []))
         for wallet in self._configured_wallets():
             try:
                 trades = user_trades(wallet, self.config.trade_poll_limit)
@@ -437,19 +491,36 @@ class BookArchiveDaemon:
             for trade in trades:
                 self.stats.wallet_trades_seen += 1
                 tid = trade_id(trade)
-                if tid in seen:
-                    continue
                 seen.add(tid)
+                if tid in journaled:
+                    continue
                 matched = self._trade_matches_archive(trade)
+                row = {
+                    "ts": iso_now(),
+                    "type": "fill",
+                    "kind": "fill",
+                    "wallet": wallet,
+                    "trade_id": tid,
+                    "archive_matched": matched,
+                    "trade": trade,
+                    "book_at_detection": self._current_book_for_trade(trade) if matched else None,
+                    **trade_fill_context(trade),
+                }
+                self.append_row("shadow", row)
+                self.stats.shadow_rows_written += 1
+                journaled.add(tid)
                 if matched:
                     self.stats.wallet_trades_matched += 1
-                    row = {"ts": iso_now(), "type": "fill", "kind": "fill", "wallet": wallet, "trade_id": tid, "trade": trade, "book_at_detection": self._current_book_for_trade(trade), **trade_fill_context(trade)}
-                    self.append_row("shadow", row)
-                    self.stats.shadow_rows_written += 1
                     now = time.time()
-                    for offset in self.config.followup_offsets_seconds:
+                    trade_ts = self._trade_timestamp(trade)
+                    missed_offsets = [offset for offset in self.config.followup_offsets_seconds if trade_ts and trade_ts + offset <= now]
+                    pending_offsets = [offset for offset in self.config.followup_offsets_seconds if offset not in missed_offsets]
+                    if missed_offsets:
+                        self._mark_followups_missed_for_trade(wallet, tid, trade, missed_offsets)
+                    for offset in pending_offsets:
                         self.followup_queue.append({"due_ts": now + offset, "offset_seconds": offset, "wallet": wallet, "trade_id": tid, "trade": trade})
         self.state["seen_trade_ids"] = list(seen)
+        self.state["journaled_trade_ids"] = list(journaled)
         self._process_due_followups()
         self.flush_prefix("shadow")
         self._save_state()

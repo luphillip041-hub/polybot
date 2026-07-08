@@ -1,14 +1,17 @@
 import unittest
+import asyncio
 import gzip
 import json
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from polymarket_bot.gamma import flatten_markets
 from polymarket_bot.scoring import score_market
 from polymarket_bot.paper import decide_paper
 from polymarket_bot.data import score_wallet
 from polymarket_bot.book_archive import normalize_levels, bbo_from_levels, trade_id, trade_fill_context, BookArchiveDaemon
+from polymarket_bot import book_archive as book_archive_module
 from polymarket_bot.archive_config import ArchiveConfig
 from polymarket_bot.status_api import RollingState, duration_s
 
@@ -131,6 +134,67 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(out["shadow"]["followups_missed_today"], 1)
         self.assertEqual(out["wallets"][0]["name"], "demo")
         self.assertEqual(duration_s(today.isoformat(), (today.replace(minute=1)).isoformat()), 60.0)
+
+    def test_seen_but_unjournaled_wallet_trade_gets_shadow_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state = root / "state.json"
+            tid = "0xabc"
+            state.write_text(json.dumps({"seen_trade_ids": [tid]}))
+            cfg = ArchiveConfig(
+                archive_dir=root,
+                state_path=state,
+                followup_queue_path=root / "followups.json",
+                tracked_wallets=["0xw"],
+                followup_offsets_seconds=(60, 300, 900),
+            )
+            daemon = BookArchiveDaemon(cfg)
+            trade = {"transactionHash": tid, "timestamp": 1, "price": 0.4, "side": "BUY", "size": 10, "asset": "no-match"}
+            with patch.object(book_archive_module, "user_trades", return_value=[trade]):
+                daemon.poll_wallets_once()
+            with gzip.open(next(root.glob("shadow_*.jsonl.gz")), "rt") as f:
+                rows = [json.loads(line) for line in f]
+            self.assertEqual(rows[0]["type"], "fill")
+            self.assertEqual(rows[0]["trade_id"], tid)
+            saved = json.loads(state.read_text())
+            self.assertIn(tid, saved["journaled_trade_ids"])
+
+    def test_ws_stale_timeout_writes_gap_and_resubscribes(self):
+        class FakeWebsocket:
+            connects = 0
+            sends = 0
+
+            async def __aenter__(self):
+                type(self).connects += 1
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def send(self, _payload):
+                type(self).sends += 1
+                if type(self).sends >= 2:
+                    daemon.running = False
+
+            async def recv(self):
+                raise asyncio.TimeoutError()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = ArchiveConfig(archive_dir=root, state_path=root / "state.json", followup_queue_path=root / "followups.json")
+            daemon = BookArchiveDaemon(cfg)
+            daemon.token_meta = {"t1": {"token_id": "t1"}}
+            daemon.ws_stale_timeout_seconds = 0.01
+            daemon.last_ws_message_ts = "2026-01-01T00:00:00+00:00"
+            with patch.object(book_archive_module.websockets, "connect", return_value=FakeWebsocket()):
+                asyncio.run(daemon.ws_loop())
+            self.assertGreaterEqual(FakeWebsocket.connects, 2)
+            self.assertGreaterEqual(FakeWebsocket.sends, 2)
+            with gzip.open(next(root.glob("book_*.jsonl.gz")), "rt") as f:
+                rows = [json.loads(line) for line in f]
+            gap = next(row for row in rows if row.get("type") == "gap")
+            self.assertEqual(gap["reason"], "ws_stale")
+            self.assertEqual(gap["tokens_affected_count"], 1)
 
 
 if __name__ == "__main__":

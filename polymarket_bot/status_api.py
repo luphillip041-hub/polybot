@@ -9,7 +9,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .archive_config import ArchiveConfig
@@ -23,6 +24,8 @@ app.add_middleware(
 )
 CONFIG = ArchiveConfig.load()
 ARCHIVE_DIR = CONFIG.archive_dir
+ROOT = Path(__file__).resolve().parents[1]
+DASHBOARD_FILE = ROOT / "dashboard" / "copybot_dash.html"
 SERVICE_NAME = "polymarket-copybot-book-archive.service"
 CACHE_TTL_SECONDS = 5.0
 
@@ -324,6 +327,22 @@ class RollingState:
 
 
 STATE = RollingState()
+
+
+def dashboard_response() -> FileResponse:
+    if not DASHBOARD_FILE.exists():
+        raise HTTPException(status_code=404, detail="dashboard/copybot_dash.html not installed")
+    return FileResponse(DASHBOARD_FILE, media_type="text/html")
+
+
+@app.get("/", include_in_schema=False)
+def get_root() -> FileResponse:
+    return dashboard_response()
+
+
+@app.get("/dashboard", include_in_schema=False)
+def get_dashboard() -> FileResponse:
+    return dashboard_response()
 
 
 @app.get("/api/status")
