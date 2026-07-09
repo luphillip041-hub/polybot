@@ -141,6 +141,21 @@
   .wallet .age{font-size:9px;margin-top:6px;color:var(--txt-dim);}
   .wallet .age.old{color:var(--amber);}
 
+  /* ---------- paper follower ---------- */
+  .rej{margin-top:10px;}
+  .rej .rrow{display:flex;align-items:center;gap:8px;margin-top:4px;font-size:9px;}
+  .rej .rlabel{width:110px;color:var(--txt-dim);text-transform:uppercase;letter-spacing:1px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .rej .rbar{height:9px;background:var(--amber);box-shadow:0 0 5px rgba(255,179,71,.35);min-width:2px;}
+  .rej .rnum{color:var(--txt);}
+  .pnl-pos{color:var(--phos)!important;}
+  .pnl-neg{color:var(--red)!important;}
+  .pw-table{width:100%;border-collapse:collapse;margin-top:10px;font-size:10px;}
+  .pw-table th{color:var(--txt-dim);text-transform:uppercase;letter-spacing:1px;font-size:9px;
+    text-align:left;padding:3px 6px;border-bottom:1px solid var(--panel-edge);font-weight:400;}
+  .pw-table td{padding:4px 6px;border-bottom:1px solid #0e1518;color:var(--txt);}
+  .pw-table td:first-child{color:var(--cyan);}
+
   footer{
     margin-top:14px;font-size:9px;color:var(--txt-dim);
     letter-spacing:1px;text-transform:uppercase;
@@ -200,6 +215,21 @@
   </div>
 
   <div class="panel">
+    <h2>Paper Follower — Forward Test</h2>
+    <div class="stats">
+      <div class="stat"><div class="k">Open positions</div><div class="v cyan" id="pPos">--</div></div>
+      <div class="stat"><div class="k">Signals today</div><div class="v" id="pSig">--</div></div>
+      <div class="stat"><div class="k">Accepts</div><div class="v" id="pAcc">--</div></div>
+      <div class="stat"><div class="k">Rejects</div><div class="v amber" id="pRej">--</div></div>
+      <div class="stat"><div class="k">Realized PnL</div><div class="v" id="pRlz">--</div><div class="sub">USD</div></div>
+      <div class="stat"><div class="k">Unrealized PnL</div><div class="v" id="pUrl">--</div><div class="sub">USD</div></div>
+      <div class="stat"><div class="k">Avg detection</div><div class="v" id="pLat">--</div><div class="sub">seconds</div></div>
+    </div>
+    <div class="rej" id="pRejBars"></div>
+    <table class="pw-table" id="pWalletTbl"></table>
+  </div>
+
+  <div class="panel">
     <h2>Tracked Wallets</h2>
     <div class="wallets" id="wallets"></div>
   </div>
@@ -235,6 +265,14 @@ function demoData(){
     coverage_pct_today:99.2,
     shadow:{fills_today:12, followups_pending:2, followups_completed_today:31,
       followups_missed_today:1, last_fill_ts:iso(new Date(now-14*60000))},
+    paper:{positions_open:2, signals_today:7, accepts_today:3, rejects_today:4,
+      rejects_by_reason:{stale_fill:2, illiquid:1, blind:1},
+      realized_pnl:4.12, unrealized_pnl:-1.35, avg_detection_latency_s:8.4,
+      per_wallet:[
+        {name:"Eztennis", signals:3, accepts:2, pnl:3.20},
+        {name:"wr0ngw4yb3tt0r", signals:3, accepts:1, pnl:-0.43},
+        {name:"S-Works", signals:1, accepts:0, pnl:0}
+      ]},
     wallets:[
       {name:"Eztennis", fills_today:4, fills_7d:38, last_fill_ts:iso(new Date(now-14*60000)), markets_touched_7d:9},
       {name:"ferrariChampions2026", fills_today:3, fills_7d:27, last_fill_ts:iso(new Date(now-2.1*3600000)), markets_touched_7d:6},
@@ -339,6 +377,48 @@ function render(d){
   }).join("");
 
   $("genAt").textContent = "LAST UPDATE: " + new Date(d.generated_at).toISOString().slice(11,19) + "Z" + (demo ? " (DEMO)" : "");
+
+  // paper follower
+  renderPaper(d.paper || null);
+}
+
+function pnlFmt(el, v){
+  el.textContent = (v>0?"+":"") + (v??0).toFixed(2);
+  el.classList.remove("pnl-pos","pnl-neg");
+  if(v > 0) el.classList.add("pnl-pos");
+  if(v < 0) el.classList.add("pnl-neg");
+}
+
+function renderPaper(p){
+  if(!p){
+    ["pPos","pSig","pAcc","pRej","pRlz","pUrl","pLat"].forEach(id=>$(id).textContent="--");
+    $("pRejBars").innerHTML = ""; $("pWalletTbl").innerHTML = "";
+    return;
+  }
+  $("pPos").textContent = p.positions_open;
+  $("pSig").textContent = p.signals_today;
+  $("pAcc").textContent = p.accepts_today;
+  $("pRej").textContent = p.rejects_today;
+  pnlFmt($("pRlz"), p.realized_pnl);
+  pnlFmt($("pUrl"), p.unrealized_pnl);
+  $("pLat").textContent = (p.avg_detection_latency_s??0).toFixed(1);
+
+  const reasons = Object.entries(p.rejects_by_reason||{}).sort((a,b)=>b[1]-a[1]);
+  const maxR = reasons.length ? reasons[0][1] : 1;
+  $("pRejBars").innerHTML = reasons.map(([k,v])=>
+    `<div class="rrow"><span class="rlabel">${k}</span>
+      <div class="rbar" style="width:${Math.max(2, v/maxR*160)}px"></div>
+      <span class="rnum">${v}</span></div>`
+  ).join("") || `<div class="rrow"><span class="rlabel" style="width:auto">no rejects today</span></div>`;
+
+  const pw = p.per_wallet||[];
+  $("pWalletTbl").innerHTML = pw.length ?
+    `<tr><th>wallet</th><th>signals</th><th>accepts</th><th>pnl</th></tr>` +
+    pw.map(w=>{
+      const cls = w.pnl>0?"pnl-pos":(w.pnl<0?"pnl-neg":"");
+      return `<tr><td>${w.name}</td><td>${w.signals}</td><td>${w.accepts}</td>
+        <td class="${cls}">${(w.pnl>0?"+":"")+(w.pnl??0).toFixed(2)}</td></tr>`;
+    }).join("") : "";
 }
 
 /* ---------- poll loop ---------- */
@@ -347,6 +427,10 @@ async function tick(){
     const r = await fetch(API, {cache:"no-store"});
     if(!r.ok) throw new Error(r.status);
     const d = await r.json();
+    try{
+      const rp = await fetch(API.replace("/api/status","/api/paper"), {cache:"no-store"});
+      if(rp.ok) d.paper = await rp.json();
+    }catch(e){ /* paper endpoint optional */ }
     demo = false;
     $("demoBanner").style.display = "none";
     render(d);
