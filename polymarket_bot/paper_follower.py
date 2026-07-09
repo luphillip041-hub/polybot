@@ -402,31 +402,32 @@ class PaperFollowerDaemon:
         reasons = reject_reasons(row, self.cfg, self.archive_cfg, self.state, signals_today)
         wallet = str(row.get("wallet") or "").lower()
         book = row.get("book_at_detection") if isinstance(row.get("book_at_detection"), dict) else {}
+        snap = book_snapshot(book)
         token = str(trade.get("asset") or book.get("token_id") or "")
         side = side_norm(row.get("fill_side") or trade.get("side"))
         if reasons:
-            rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": ",".join(reasons)})
+            rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": ",".join(reasons), "book_snapshot": snap})
             out.append(rej)
         elif side == "SELL":
             pos_id = position_key(wallet, token)
             pos = self.state.get("positions", {}).pop(pos_id)
             price, shares, fill_err = simulate_fill(book, "SELL", num(pos.get("cost_usd"), self.cfg.stake_usd), self.cfg.haircut)
             if fill_err:
-                ex = dict(out[0]); ex.update({"ts": iso_now(), "type": "reject", "reject_reason": fill_err, "position_id": pos_id})
+                ex = dict(out[0]); ex.update({"ts": iso_now(), "type": "reject", "reject_reason": fill_err, "position_id": pos_id, "book_snapshot": snap})
             else:
                 proceeds = shares * (price or 0)
                 pnl = proceeds - num(pos.get("cost_usd"), 0)
-                ex = dict(out[0]); ex.update({"ts": iso_now(), "type": "exit", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "pnl": pnl})
+                ex = dict(out[0]); ex.update({"ts": iso_now(), "type": "exit", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "pnl": pnl, "book_snapshot": snap})
             out.append(ex)
         else:
             price, shares, fill_err = simulate_fill(book, "BUY", self.cfg.stake_usd, self.cfg.haircut)
             if fill_err:
-                ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "reject", "reject_reason": fill_err})
+                ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "reject", "reject_reason": fill_err, "book_snapshot": snap})
                 out.append(ent)
             else:
                 pos_id = position_key(wallet, token)
                 self.state.setdefault("positions", {})[pos_id] = {"position_id": pos_id, "wallet": wallet, "token": token, "entry_price": price, "shares": shares, "cost_usd": self.cfg.stake_usd, "opened_at": iso_now()}
-                ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "entry", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id})
+                ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "entry", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "book_snapshot": snap})
                 out.append(ent)
         self.state.setdefault("processed_trade_ids", []).append(tid)
         self.state["processed_trade_ids"] = list(dict.fromkeys(self.state["processed_trade_ids"]))[-20000:]

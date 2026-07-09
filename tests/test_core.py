@@ -240,9 +240,29 @@ class CoreTests(unittest.TestCase):
                 append_jsonl_fsync(cfg.ledger_path, out)
             self.assertEqual(rows[1]["type"], "reject")
             self.assertIn("stale_fill", rows[1]["reject_reason"])
+            self.assertEqual(set(rows[1]["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
             status = paper_status(cfg)
             self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "rejects_today", "rejects_by_reason", "realized_pnl", "unrealized_pnl", "avg_detection_latency_s", "per_wallet"})
             self.assertGreaterEqual(status["rejects_today"], 1)
+    def test_paper_follower_entry_and_exit_rows_include_book_snapshot(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = root / "archive"
+            paper = root / "paper"
+            archive.mkdir(); paper.mkdir()
+            cfg = PaperConfig(paper_dir=paper, ledger_path=paper / "ledger.jsonl", state_path=paper / "state.json", allowlist_path=paper / "allowlist.json", data_quality_path=paper / "data_quality.json", max_ws_age_seconds=999999999)
+            cfg.allowlist_path.write_text(json.dumps({"wallets": ["0xw"]}))
+            acfg = ArchiveConfig(archive_dir=archive, state_path=root / "shadow_state.json", followup_queue_path=archive / "followups.json")
+            daemon = PaperFollowerDaemon(cfg, acfg)
+            book = {"token_id": "tok", "best_bid": 0.49, "best_ask": 0.5, "best_bid_size": 1000, "best_ask_size": 1000, "spread": 0.01, "top3_asks": [{"price": 0.5, "size": 1000}], "top3_bids": [{"price": 0.49, "size": 1000}]}
+            buy = {"ts": "2026-01-01T00:00:00+00:00", "wallet": "0xw", "trade_id": "buy1", "fill_timestamp": "2026-01-01T00:00:00+00:00", "fill_side": "BUY", "fill_price": 0.5, "trade": {"asset": "tok", "side": "BUY", "timestamp": "2026-01-01T00:00:00+00:00", "price": 0.5, "conditionId": "m"}, "book_at_detection": book}
+            buy_rows = daemon.process_fill(buy, 0)
+            entry = next(row for row in buy_rows if row["type"] == "entry")
+            self.assertEqual(set(entry["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
+            sell = {"ts": "2026-01-01T00:00:01+00:00", "wallet": "0xw", "trade_id": "sell1", "fill_timestamp": "2026-01-01T00:00:01+00:00", "fill_side": "SELL", "fill_price": 0.49, "trade": {"asset": "tok", "side": "SELL", "timestamp": "2026-01-01T00:00:01+00:00", "price": 0.49, "conditionId": "m"}, "book_at_detection": book}
+            sell_rows = daemon.process_fill(sell, 1)
+            exit_row = next(row for row in sell_rows if row["type"] == "exit")
+            self.assertEqual(set(exit_row["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
 
 
 if __name__ == "__main__":
