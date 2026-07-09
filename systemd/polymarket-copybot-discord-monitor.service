@@ -10,7 +10,7 @@ Type=simple
 WorkingDirectory=/root/flip/projects/polymarket-copybot
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/root/flip/secrets/copybot_discord.env
-ExecStart=/usr/bin/python3 -m polymarket_bot.discord_monitor
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python -m polymarket_bot.discord_monitor
 Restart=always
 RestartSec=10
 NoNewPrivileges=true
