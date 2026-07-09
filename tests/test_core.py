@@ -14,6 +14,7 @@ from polymarket_bot.book_archive import normalize_levels, bbo_from_levels, trade
 from polymarket_bot import book_archive as book_archive_module
 from polymarket_bot.archive_config import ArchiveConfig
 from polymarket_bot.status_api import RollingState, duration_s
+from polymarket_bot.paper_follower import PaperConfig, PaperFollowerDaemon, paper_status, read_jsonl, simulate_fill
 
 
 class CoreTests(unittest.TestCase):
@@ -195,6 +196,53 @@ class CoreTests(unittest.TestCase):
             gap = next(row for row in rows if row.get("type") == "gap")
             self.assertEqual(gap["reason"], "ws_stale")
             self.assertEqual(gap["tokens_affected_count"], 1)
+
+    def test_paper_fill_model_walks_levels_and_haircuts(self):
+        book = {
+            "top3_asks": [{"price": 0.5, "size": 100}, {"price": 0.6, "size": 100}],
+            "top3_bids": [{"price": 0.4, "size": 100}, {"price": 0.3, "size": 100}],
+        }
+        buy_price, buy_size, err = simulate_fill(book, "BUY", 100, 0.005)
+        self.assertIsNone(err)
+        self.assertGreater(buy_price, 0.5)
+        self.assertGreater(buy_size, 0)
+        sell_price, sell_size, err = simulate_fill(book, "SELL", 60, 0.005)
+        self.assertIsNone(err)
+        self.assertLess(sell_price, 0.4)
+        self.assertGreater(sell_size, 0)
+
+    def test_paper_follower_rejects_stale_fill_and_status_shape(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = root / "archive"
+            paper = root / "paper"
+            archive.mkdir()
+            cfg = PaperConfig(paper_dir=paper, ledger_path=paper / "ledger.jsonl", state_path=paper / "state.json", allowlist_path=paper / "allowlist.json", data_quality_path=paper / "data_quality.json")
+            paper.mkdir()
+            cfg.allowlist_path.write_text(json.dumps({"wallets": ["0xw"]}))
+            acfg = ArchiveConfig(archive_dir=archive, state_path=root / "shadow_state.json", followup_queue_path=archive / "followups.json")
+            daemon = PaperFollowerDaemon(cfg, acfg)
+            row = {
+                "ts": "2026-01-01T00:10:00+00:00",
+                "type": "fill",
+                "wallet": "0xw",
+                "trade_id": "t1",
+                "archive_matched": True,
+                "fill_timestamp": 1,
+                "fill_side": "BUY",
+                "fill_price": 0.5,
+                "trade": {"asset": "tok", "side": "BUY", "timestamp": 1, "price": 0.5, "conditionId": "m"},
+                "book_at_detection": {"token_id": "tok", "best_bid": 0.49, "best_ask": 0.5, "best_bid_size": 1000, "best_ask_size": 1000, "spread": 0.01, "top3_asks": [{"price": 0.5, "size": 1000}], "top3_bids": [{"price": 0.49, "size": 1000}]},
+            }
+            rows = daemon.process_fill(row, 0)
+            for out in rows:
+                from polymarket_bot.paper_follower import append_jsonl_fsync
+                append_jsonl_fsync(cfg.ledger_path, out)
+            self.assertEqual(rows[1]["type"], "reject")
+            self.assertIn("stale_fill", rows[1]["reject_reason"])
+            status = paper_status(cfg)
+            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "rejects_today", "rejects_by_reason", "realized_pnl", "unrealized_pnl", "avg_detection_latency_s", "per_wallet"})
+            self.assertGreaterEqual(status["rejects_today"], 1)
 
 
 if __name__ == "__main__":

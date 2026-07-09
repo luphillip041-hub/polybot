@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .archive_config import ArchiveConfig
+from .paper_follower import paper_status
 
 app = FastAPI(title="Polymarket Copybot Status API", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
@@ -354,6 +355,11 @@ def get_status() -> dict[str, Any]:
 @app.get("/api/gaps")
 def get_gaps(days: int = Query(7, ge=1, le=14)) -> list[dict[str, Any]]:
     return STATE.gaps(days)
+
+
+@app.get("/api/paper")
+def get_paper() -> dict[str, Any]:
+    return paper_status()
 
 
 def main() -> None:
