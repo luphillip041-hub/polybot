@@ -6,6 +6,8 @@ import logging
 import os
 import signal
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -438,14 +440,24 @@ class PaperFollowerDaemon:
         existing = read_jsonl(self.cfg.ledger_path)
         signals_today = sum(1 for r in existing if r.get("type") == "signal" and (parse_ts(r.get("ts")) or today) >= today)
         wrote = 0
+        notify_rows: list[dict[str, Any]] = []
         for fill in iter_shadow_fills(self.archive_cfg):
             rows = self.process_fill(fill, signals_today)
             if rows:
                 signals_today += 1
             for row in rows:
                 append_jsonl_fsync(self.cfg.ledger_path, row)
+                if row.get("type") in {"entry", "exit"}:
+                    notify_rows.append(row)
                 wrote += 1
         save_state(self.cfg.state_path, self.state)
+        webhook_url = os.getenv("POLYMARKET_PAPER_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK_URL")
+        if webhook_url and notify_rows:
+            status = paper_status(self.cfg)
+            for row in notify_rows:
+                message = render_trade_webhook(row, status)
+                if message:
+                    post_discord_webhook(webhook_url, message)
         return wrote
 
     def run(self) -> None:
@@ -476,6 +488,7 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
         for reason in str(row.get("reject_reason") or "unknown").split(","):
             rejects_by_reason[reason] = rejects_by_reason.get(reason, 0) + 1
     state = load_state(cfg.state_path)
+    positions = state.get("positions", {}) if isinstance(state.get("positions"), dict) else {}
     names = wallet_name_map()
     per: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -489,17 +502,63 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
             b["pnl"] += num(row.get("pnl"), 0)
     latencies = [num(r.get("detection_latency_s"), 0) for r in signals if r.get("detection_latency_s") is not None]
     realized = sum(num(r.get("pnl"), 0) for r in exits)
+    open_notional = sum(num(pos.get("cost_usd"), 0) for pos in positions.values() if isinstance(pos, dict))
+    unrealized = 0.0
+    account_value = realized + unrealized + open_notional
     return {
-        "positions_open": len(state.get("positions", {})),
+        "positions_open": len(positions),
         "signals_today": len(signals),
         "accepts_today": len(entries),
         "rejects_today": len(rejects),
         "rejects_by_reason": rejects_by_reason,
         "realized_pnl": round(realized, 4),
-        "unrealized_pnl": 0.0,
+        "unrealized_pnl": round(unrealized, 4),
+        "open_notional": round(open_notional, 4),
+        "account_value": round(account_value, 4),
         "avg_detection_latency_s": round(sum(latencies) / len(latencies), 3) if latencies else 0.0,
         "per_wallet": sorted(per.values(), key=lambda x: x["signals"], reverse=True),
     }
+
+
+def render_trade_webhook(row: dict[str, Any], status: dict[str, Any]) -> str | None:
+    kind = str(row.get("type") or "")
+    if kind not in {"entry", "exit"}:
+        return None
+    emoji = "🟢" if kind == "entry" else "🔴"
+    label = "PAPER BUY" if kind == "entry" else "PAPER SELL"
+    wallet = str(row.get("wallet") or "unknown")
+    market = str(row.get("market") or "unknown")
+    token = str(row.get("token") or "")
+    price = row.get("sim_fill_price")
+    size = row.get("sim_size")
+    pnl = row.get("pnl")
+    account_value = status.get("account_value")
+    open_notional = status.get("open_notional")
+    realized = status.get("realized_pnl")
+    snap = row.get("book_snapshot") if isinstance(row.get("book_snapshot"), dict) else {}
+    lines = [
+        f"{emoji} **{label}**",
+        f"Wallet: `{wallet}`",
+        f"Market: `{market}`",
+        f"Token: `{token[:12]}…`" if token else "Token: `unknown`",
+        f"Fill: `{price}` x `{size}` | side `{row.get('side')}`",
+        f"Book: bid `{snap.get('best_bid')}` ask `{snap.get('best_ask')}` spread `{snap.get('spread')}`",
+        f"Paper account value: `${account_value}` | open `${open_notional}` | realized PnL `${realized}`",
+    ]
+    if pnl is not None:
+        lines.append(f"Trade PnL: `${pnl}`")
+    return "\n".join(lines)[:1900]
+
+
+def post_discord_webhook(url: str, content: str) -> bool:
+    payload = json.dumps({"content": content}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json", "User-Agent": "polymarket-copybot-paper/1.0"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, TimeoutError, OSError):
+        LOG.exception("paper webhook post failed")
+        return False
 
 
 def configure_logging() -> None:

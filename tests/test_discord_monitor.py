@@ -16,6 +16,7 @@ from polymarket_bot.discord_monitor import (
     evaluate_poll,
     render_daily_digest,
     render_gaps,
+    render_paper_card,
     render_status_card,
     render_wallets,
 )
@@ -113,6 +114,21 @@ class DiscordMonitorTests(unittest.TestCase):
         self.assertIn("Polymarket Copybot Status", render_status_card(s))
         self.assertIn("alpha", render_wallets(s, datetime(2026, 7, 8, 13, 0, tzinfo=UTC)))
         self.assertIn("unit", render_gaps(s))
+        paper = {
+            "account_value": 100.0,
+            "open_notional": 100.0,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "signals_today": 3,
+            "accepts_today": 1,
+            "rejects_today": 2,
+            "avg_detection_latency_s": 4.2,
+            "rejects_by_reason": {"stale_fill": 2},
+            "per_wallet": [{"name": "alpha", "signals": 3, "accepts": 1, "pnl": 0.0}],
+        }
+        paper_card = render_paper_card(paper)
+        self.assertIn("Paper Follower Wallet", paper_card)
+        self.assertIn("$100.00", paper_card)
 
     def test_daily_digest_flags_zero_fill_wallet_and_reasons(self):
         digest = render_daily_digest(

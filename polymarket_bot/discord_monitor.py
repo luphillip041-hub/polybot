@@ -12,6 +12,7 @@ from discord import app_commands
 
 STATUS_URL = "http://127.0.0.1:8710/api/status"
 GAPS_URL = "http://127.0.0.1:8710/api/gaps?days=2"
+PAPER_URL = "http://127.0.0.1:8710/api/paper"
 POLL_SECONDS = 60
 ALERT_COOLDOWN_SECONDS = 30 * 60
 UNREACHABLE_GRACE_SECONDS = 2 * 60
@@ -223,6 +224,29 @@ def render_status_card(status: dict[str, Any]) -> str:
     )
 
 
+def render_paper_card(paper: dict[str, Any]) -> str:
+    reasons = paper.get("rejects_by_reason") if isinstance(paper.get("rejects_by_reason"), dict) else {}
+    account_value = float(paper.get("account_value") or 0.0)
+    open_notional = float(paper.get("open_notional") or 0.0)
+    realized = float(paper.get("realized_pnl") or 0.0)
+    unrealized = float(paper.get("unrealized_pnl") or 0.0)
+    lines = [
+        "💼 **Paper Follower Wallet**",
+        f"Account value: `${account_value:.2f}` | open `${open_notional:.2f}`",
+        f"PnL: realized `${realized:.2f}` | unrealized `${unrealized:.2f}`",
+        f"Today: signals `{paper.get('signals_today')}` accepts `{paper.get('accepts_today')}` rejects `{paper.get('rejects_today')}`",
+        f"Avg detection latency: `{paper.get('avg_detection_latency_s')}s`",
+        f"Rejects: `{reasons}`",
+    ]
+    per_wallet = paper.get("per_wallet") if isinstance(paper.get("per_wallet"), list) else []
+    if per_wallet:
+        lines.append("**Wallets**")
+        for row in per_wallet[:8]:
+            if isinstance(row, dict):
+                lines.append(f"- `{row.get('name')}` signals `{row.get('signals')}` accepts `{row.get('accepts')}` pnl `${float(row.get('pnl') or 0):.2f}`")
+    return "\n".join(lines)[:1900]
+
+
 def render_wallets(status: dict[str, Any], now: datetime | None = None) -> str:
     wallets = status.get("wallets") if isinstance(status.get("wallets"), list) else []
     if not wallets:
@@ -296,6 +320,7 @@ class CopybotMonitor(discord.Client):
         self.tree.add_command(app_commands.Command(name="status", description="Read-only copybot status", callback=self.cmd_status))
         self.tree.add_command(app_commands.Command(name="wallets", description="Read-only wallet fill summary", callback=self.cmd_wallets))
         self.tree.add_command(app_commands.Command(name="gaps", description="Read-only copybot gaps today", callback=self.cmd_gaps))
+        self.tree.add_command(app_commands.Command(name="paper", description="Read-only paper wallet value", callback=self.cmd_paper))
         await self.tree.sync()
         self.poll_task = asyncio.create_task(self.poll_loop())
 
@@ -315,6 +340,9 @@ class CopybotMonitor(discord.Client):
 
     async def fetch_gaps(self) -> list[dict[str, Any]]:
         return await self.fetch_json(GAPS_URL)
+
+    async def fetch_paper(self) -> dict[str, Any]:
+        return await self.fetch_json(PAPER_URL)
 
     async def send_channel(self, content: str) -> None:
         channel = self.get_channel(self.channel_id) or await self.fetch_channel(self.channel_id)
@@ -357,6 +385,9 @@ class CopybotMonitor(discord.Client):
 
     async def cmd_gaps(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(render_gaps(await self.fetch_status()))
+
+    async def cmd_paper(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(render_paper_card(await self.fetch_paper()))
 
 
 def main() -> None:

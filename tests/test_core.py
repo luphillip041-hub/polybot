@@ -14,7 +14,7 @@ from polymarket_bot.book_archive import normalize_levels, bbo_from_levels, trade
 from polymarket_bot import book_archive as book_archive_module
 from polymarket_bot.archive_config import ArchiveConfig
 from polymarket_bot.status_api import RollingState, duration_s
-from polymarket_bot.paper_follower import PaperConfig, PaperFollowerDaemon, paper_status, read_jsonl, simulate_fill
+from polymarket_bot.paper_follower import PaperConfig, PaperFollowerDaemon, paper_status, read_jsonl, render_trade_webhook, simulate_fill
 
 
 class CoreTests(unittest.TestCase):
@@ -242,7 +242,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("stale_fill", rows[1]["reject_reason"])
             self.assertEqual(set(rows[1]["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
             status = paper_status(cfg)
-            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "rejects_today", "rejects_by_reason", "realized_pnl", "unrealized_pnl", "avg_detection_latency_s", "per_wallet"})
+            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "rejects_today", "rejects_by_reason", "realized_pnl", "unrealized_pnl", "open_notional", "account_value", "avg_detection_latency_s", "per_wallet"})
             self.assertGreaterEqual(status["rejects_today"], 1)
     def test_paper_follower_entry_and_exit_rows_include_book_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
@@ -263,6 +263,9 @@ class CoreTests(unittest.TestCase):
             sell_rows = daemon.process_fill(sell, 1)
             exit_row = next(row for row in sell_rows if row["type"] == "exit")
             self.assertEqual(set(exit_row["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
+            msg = render_trade_webhook(entry, {"account_value": 100, "open_notional": 100, "realized_pnl": 0})
+            self.assertIn("PAPER BUY", msg)
+            self.assertIn("Paper account value", msg)
 
 
 if __name__ == "__main__":
