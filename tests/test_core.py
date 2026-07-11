@@ -242,7 +242,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("stale_fill", rows[1]["reject_reason"])
             self.assertEqual(set(rows[1]["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
             status = paper_status(cfg)
-            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "rejects_today", "rejects_by_reason", "realized_pnl", "unrealized_pnl", "open_notional", "account_value", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet"})
+            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "accepts_by_latency", "rejects_today", "rejects_by_reason", "realized_pnl", "unrealized_pnl", "open_notional", "account_value", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet"})
             self.assertGreaterEqual(status["rejects_today"], 1)
     def test_paper_follower_entry_and_exit_rows_include_book_snapshot(self):
         with tempfile.TemporaryDirectory() as td:

@@ -31,7 +31,7 @@ class PaperConfig:
     max_signals_per_day: int = 20
     max_spread: float = 0.04
     min_top3_liquidity_multiple: float = 2.0
-    stale_fill_seconds: float = 120.0
+    stale_fill_seconds: float = 480.0
     max_ws_age_seconds: float = 60.0
     haircut: float = 0.005
     poll_interval_seconds: float = 3.0
@@ -518,10 +518,23 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
     n = len(sorted_lat)
     latency_p50 = sorted_lat[n // 2] if n else 0.0
     latency_p90 = sorted_lat[int(n * 0.9)] if n else 0.0
+    # Bucket accepts by latency
+    entries_by_latency = {"<120s": 0, "120-300s": 0, ">300s": 0}
+    for r in entries:
+        lat = num(r.get("detection_latency_s"), -1)
+        if lat < 0:
+            continue
+        if lat < 120:
+            entries_by_latency["<120s"] += 1
+        elif lat <= 300:
+            entries_by_latency["120-300s"] += 1
+        else:
+            entries_by_latency[">300s"] += 1
     return {
         "positions_open": len(positions),
         "signals_today": len(signals),
         "accepts_today": len(entries),
+        "accepts_by_latency": entries_by_latency,
         "rejects_today": len(rejects),
         "rejects_by_reason": rejects_by_reason,
         "realized_pnl": round(realized, 4),
