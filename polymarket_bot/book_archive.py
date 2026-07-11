@@ -136,6 +136,7 @@ class BookArchiveDaemon:
         self.wallet_driven_tokens: set[str] = set()
         self.wallet_driven_condition_ids: set[str] = set()
         self.wallet_trade_seen_tokens: set[str] = set()
+        self._wallet_seed_done: bool = False
         self._ws_reconnect_requested: bool = False
         self._mark_startup_missed_followups()
 
@@ -352,6 +353,32 @@ class BookArchiveDaemon:
             condition = str(trade.get("conditionId") or trade.get("condition_id") or "")
             self._add_wallet_driven_token(token, condition)
 
+    def _seed_wallet_driven_tokens_30d(self) -> None:
+        """One-time startup seed: pull each tracked wallet's /trades for ~30d,
+        collect all unique tokens, subscribe them as wallet-driven."""
+        if self._wallet_seed_done:
+            return
+        self._wallet_seed_done = True
+        LOG.info("seeding wallet-driven tokens from last 30d of /trades...")
+        seeded = 0
+        for wallet in self._configured_wallets():
+            try:
+                # Fetch a batch large enough to cover 30d of activity
+                trades = user_trades(wallet, limit=500)
+            except Exception:
+                LOG.exception("seed wallet trades failed wallet=%s", wallet)
+                continue
+            for trade in (trades or []):
+                if not isinstance(trade, dict):
+                    continue
+                token = str(trade.get("asset") or trade.get("assetId") or trade.get("token_id") or trade.get("tokenId") or trade.get("clobTokenId") or "")
+                condition = str(trade.get("conditionId") or trade.get("condition_id") or "")
+                if token and token not in self.token_meta and token not in self.wallet_driven_tokens:
+                    self._add_wallet_driven_token(token, condition)
+                    seeded += 1
+        LOG.info("wallet-driven seed complete: added %d tokens from %d wallets", seeded, len(self._configured_wallets()))
+        self.flush_all()
+
     def record_book(self, token_id: str, bids: Any, asks: Any, *, source: str, event_type: str | None = None, force: bool = False) -> None:
         if token_id not in self.token_meta:
             return
@@ -552,6 +579,10 @@ class BookArchiveDaemon:
                     LOG.debug("wallet fill latency wallet=%s trade_id=%s latency=%.1fs", wallet, tid[:12], detection_latency)
                 # Ensure wallet trade tokens are in the archive universe
                 self._ensure_wallet_trade_tokens(trade)
+                # Track all unique tokens seen from wallet fills
+                token = str(trade.get("asset") or trade.get("assetId") or trade.get("token_id") or trade.get("tokenId") or trade.get("clobTokenId") or "")
+                if token:
+                    self.wallet_trade_seen_tokens.add(token)
                 if tid in journaled:
                     continue
                 matched = self._trade_matches_archive(trade)
@@ -650,6 +681,7 @@ class BookArchiveDaemon:
                 },
                 "wallets_tracked": len(self._configured_wallets()),
                 "wallet_driven_tokens": len(self.wallet_driven_tokens),
+                "wallet_trade_seen_tokens": len(self.wallet_trade_seen_tokens),
                 "pending_followups": len(self.followup_queue),
                 "archive_dir": str(self.config.archive_dir),
             }
@@ -672,6 +704,7 @@ class BookArchiveDaemon:
 
     async def run(self) -> None:
         self.discover_markets()
+        self._seed_wallet_driven_tokens_30d()
         self.rest_snapshot_once()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):

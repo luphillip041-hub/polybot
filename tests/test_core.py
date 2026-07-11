@@ -129,7 +129,7 @@ class CoreTests(unittest.TestCase):
         ]
         out = st.status()
         self.assertEqual(set(out.keys()), {"generated_at", "archiver", "gaps_today", "coverage_pct_today", "shadow", "wallets"})
-        self.assertEqual(set(out["archiver"].keys()), {"service_active", "ws_connected", "last_ws_message_age_s", "markets", "tokens", "book_rows_this_hour", "mb_per_day", "retention_days", "retention_gb", "wallet_driven_tokens"})
+        self.assertEqual(set(out["archiver"].keys()), {"service_active", "ws_connected", "last_ws_message_age_s", "markets", "tokens", "book_rows_this_hour", "mb_per_day", "retention_days", "retention_gb", "wallet_driven_tokens", "wallet_token_coverage_pct"})
         self.assertEqual(out["shadow"]["fills_today"], 1)
         self.assertEqual(out["shadow"]["followups_completed_today"], 1)
         self.assertEqual(out["shadow"]["followups_missed_today"], 1)

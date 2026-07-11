@@ -12,7 +12,7 @@ from .config import CONFIG
 @dataclass(frozen=True)
 class ArchiveConfig:
     # Public-data-only order book archive. No keys, no order placement.
-    top_n_markets: int = 50
+    top_n_markets: int = 10
     gamma_event_limit: int = 200
     snapshot_interval_seconds: int = 30
     wallet_poll_interval_seconds: int = 15
@@ -23,7 +23,7 @@ class ArchiveConfig:
     followup_offsets_seconds: tuple[int, ...] = (60, 300, 900)
     max_write_interval_per_token_seconds: float = 30.0
     heartbeat_interval_seconds: int = 60
-    max_tokens: int = 400
+    max_tokens: int = 800
     archive_dir: Path = CONFIG.runs_dir / "book_archive"
     state_path: Path = CONFIG.runs_dir / "shadow_journal_state.json"
     followup_queue_path: Path = CONFIG.runs_dir / "book_archive" / "followup_queue.json"

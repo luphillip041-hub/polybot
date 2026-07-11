@@ -227,6 +227,7 @@ class RollingState:
                 "retention_days": int(disk.get("retention_days") or CONFIG.retention_days),
                 "retention_gb": float(disk.get("retention_gb") or 0.0),
                 "wallet_driven_tokens": int(self.heartbeat.get("wallet_driven_tokens") or 0),
+                "wallet_token_coverage_pct": self._compute_wallet_coverage(),
             },
             "gaps_today": today_gaps,
             "coverage_pct_today": float(round(max(0.0, min(100.0, 100.0 * (elapsed_today - gap_seconds) / elapsed_today)), 6)),
@@ -287,6 +288,38 @@ class RollingState:
             if ts and start <= ts < end:
                 out.append(r)
         return out
+
+    def _tokens_from_shadow_fills(self, days: int = 7) -> set[str]:
+        """Return unique token IDs seen in shadow fills over the last N days."""
+        cutoff = utc_now() - timedelta(days=days)
+        tokens: set[str] = set()
+        for r in self.shadow_rows:
+            rtype = r.get("type") or r.get("kind")
+            if rtype not in ("fill",):
+                continue
+            ts = parse_ts(r.get("ts") or r.get("fill_timestamp"))
+            if ts and ts < cutoff:
+                continue
+            # Token from trade.asset for new format, or token from fill data
+            trade = r.get("trade") if isinstance(r.get("trade"), dict) else {}
+            tok = trade.get("asset") or r.get("token_id") or ""
+            if tok:
+                tokens.add(tok)
+            # Also try other known token fields
+            for key in ("asset", "assetId", "token_id", "tokenId", "clobTokenId"):
+                val = trade.get(key) or r.get(key)
+                if val:
+                    tokens.add(str(val))
+        return tokens
+
+    def _compute_wallet_coverage(self) -> float:
+        """wallet_token_coverage_pct = wallet-driven subscribed / tokens seen in last 7d of wallet fills."""
+        wd_tokens = int(self.heartbeat.get("wallet_driven_tokens") or 0)
+        tokens_7d = self._tokens_from_shadow_fills(days=7)
+        total = len(tokens_7d)
+        if total == 0:
+            return 100.0 if wd_tokens > 0 else 0.0
+        return round(min(100.0, wd_tokens / total * 100), 1)
 
     def _wallets(self) -> list[dict[str, Any]]:
         now = utc_now()
