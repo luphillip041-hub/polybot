@@ -226,6 +226,7 @@ class RollingState:
                 "mb_per_day": float(disk.get("compressed_mb_per_day") or 0.0),
                 "retention_days": int(disk.get("retention_days") or CONFIG.retention_days),
                 "retention_gb": float(disk.get("retention_gb") or 0.0),
+                "wallet_driven_tokens": int(self.heartbeat.get("wallet_driven_tokens") or 0),
             },
             "gaps_today": today_gaps,
             "coverage_pct_today": float(round(max(0.0, min(100.0, 100.0 * (elapsed_today - gap_seconds) / elapsed_today)), 6)),

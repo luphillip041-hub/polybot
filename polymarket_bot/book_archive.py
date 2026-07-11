@@ -133,6 +133,9 @@ class BookArchiveDaemon:
         self.followup_queue = self._load_followup_queue()
         self.last_ws_message_ts: str | None = None
         self.ws_stale_timeout_seconds = float(os.getenv("POLYMARKET_WS_STALE_TIMEOUT_SECONDS", "60"))
+        self.wallet_driven_tokens: set[str] = set()
+        self.wallet_driven_condition_ids: set[str] = set()
+        self.wallet_trade_seen_tokens: set[str] = set()
         self._mark_startup_missed_followups()
 
     def _load_state(self) -> dict[str, Any]:
@@ -299,10 +302,53 @@ class BookArchiveDaemon:
                     "liquidity": market.get("liquidity"),
                     "volume_24h": market.get("volume_24h"),
                 }
-        self.stats.markets_covered = len(selected)
+        # Restore wallet-driven tokens post refresh
+        self._restore_wallet_driven_tokens()
+        # Apply token ceiling
+        self._evict_excess_tokens()
+        self.stats.markets_covered = len(selected) + len(self.wallet_driven_condition_ids)
         self.stats.tokens_covered = len(self.token_meta)
         write_json(self.config.archive_dir / "markets_latest.json", {"ts": iso_now(), "markets": selected, "tokens": self.token_meta})
-        LOG.info("discovered markets=%s tokens=%s", self.stats.markets_covered, self.stats.tokens_covered)
+        LOG.info("discovered markets=%s tokens=%s wallet_driven_tokens=%s", len(selected), self.stats.tokens_covered, len(self.wallet_driven_tokens))
+
+    def _add_wallet_driven_token(self, token_id: str, condition_id: str | None = None) -> None:
+        """Add a token from wallet activity to the archive universe."""
+        if token_id in self.token_meta or token_id in self.wallet_driven_tokens:
+            return
+        self.wallet_driven_tokens.add(token_id)
+        if condition_id:
+            self.wallet_driven_condition_ids.add(str(condition_id).lower())
+        self.token_meta[token_id] = {"token_id": token_id, "wallet_driven": True}
+        LOG.info("universe_add token=%s wallet_driven=%s condition_id=%s tokens_total=%s", token_id[:12], True, condition_id, len(self.token_meta))
+
+    def _restore_wallet_driven_tokens(self) -> None:
+        """Re-add wallet-driven tokens that were cleared by discover_markets()."""
+        for token_id in self.wallet_driven_tokens:
+            if token_id not in self.token_meta:
+                self.token_meta[token_id] = {"token_id": token_id, "wallet_driven": True}
+
+    def _evict_excess_tokens(self) -> None:
+        """Keep total tokens under max_tokens ceiling.
+        Evict oldest non-wallet-driven (top-50 baseline) tokens first, never wallet-driven ones."""
+        max_tokens = self.config.max_tokens
+        if len(self.token_meta) <= max_tokens:
+            return
+        evict_candidates = [tid for tid in self.token_meta if tid not in self.wallet_driven_tokens]
+        if not evict_candidates:
+            return
+        evict_count = len(self.token_meta) - max_tokens
+        to_evict = sorted(evict_candidates)[:evict_count]
+        for tid in to_evict:
+            meta = self.token_meta.pop(tid, None)
+            LOG.info("universe_evict token=%s wallet_driven=False tokens_after=%s", tid[:12], len(self.token_meta))
+        self.stats.tokens_covered = len(self.token_meta)
+
+    def _ensure_wallet_trade_tokens(self, trade: dict[str, Any]) -> None:
+        """If a wallet trade references tokens not in the archive, add them dynamically."""
+        token = str(trade.get("asset") or trade.get("assetId") or trade.get("token_id") or trade.get("tokenId") or trade.get("clobTokenId") or "")
+        if token and token not in self.token_meta:
+            condition = str(trade.get("conditionId") or trade.get("condition_id") or "")
+            self._add_wallet_driven_token(token, condition)
 
     def record_book(self, token_id: str, bids: Any, asks: Any, *, source: str, event_type: str | None = None, force: bool = False) -> None:
         if token_id not in self.token_meta:
@@ -492,6 +538,8 @@ class BookArchiveDaemon:
                 self.stats.wallet_trades_seen += 1
                 tid = trade_id(trade)
                 seen.add(tid)
+                # Ensure wallet trade tokens are in the archive universe
+                self._ensure_wallet_trade_tokens(trade)
                 if tid in journaled:
                     continue
                 matched = self._trade_matches_archive(trade)
@@ -585,6 +633,7 @@ class BookArchiveDaemon:
                     "retention_gb": round(self.stats.retention_footprint_bytes / 1_000_000_000, 3),
                 },
                 "wallets_tracked": len(self._configured_wallets()),
+                "wallet_driven_tokens": len(self.wallet_driven_tokens),
                 "pending_followups": len(self.followup_queue),
                 "archive_dir": str(self.config.archive_dir),
             }

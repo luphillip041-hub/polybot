@@ -11,7 +11,7 @@ from polymarket_bot.scoring import score_market
 from polymarket_bot.paper import decide_paper
 from polymarket_bot.data import score_wallet
 from polymarket_bot.book_archive import normalize_levels, bbo_from_levels, trade_id, trade_fill_context, BookArchiveDaemon
-from polymarket_bot import book_archive as book_archive_module
+import polymarket_bot.book_archive as book_archive_module
 from polymarket_bot.archive_config import ArchiveConfig
 from polymarket_bot.status_api import RollingState, duration_s
 from polymarket_bot.paper_follower import PaperConfig, PaperFollowerDaemon, paper_status, read_jsonl, render_trade_webhook, simulate_fill
@@ -129,7 +129,7 @@ class CoreTests(unittest.TestCase):
         ]
         out = st.status()
         self.assertEqual(set(out.keys()), {"generated_at", "archiver", "gaps_today", "coverage_pct_today", "shadow", "wallets"})
-        self.assertEqual(set(out["archiver"].keys()), {"service_active", "ws_connected", "last_ws_message_age_s", "markets", "tokens", "book_rows_this_hour", "mb_per_day", "retention_days", "retention_gb"})
+        self.assertEqual(set(out["archiver"].keys()), {"service_active", "ws_connected", "last_ws_message_age_s", "markets", "tokens", "book_rows_this_hour", "mb_per_day", "retention_days", "retention_gb", "wallet_driven_tokens"})
         self.assertEqual(out["shadow"]["fills_today"], 1)
         self.assertEqual(out["shadow"]["followups_completed_today"], 1)
         self.assertEqual(out["shadow"]["followups_missed_today"], 1)
@@ -242,7 +242,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("stale_fill", rows[1]["reject_reason"])
             self.assertEqual(set(rows[1]["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
             status = paper_status(cfg)
-            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "rejects_today", "rejects_by_reason", "realized_pnl", "unrealized_pnl", "open_notional", "account_value", "avg_detection_latency_s", "per_wallet"})
+            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "rejects_today", "rejects_by_reason", "realized_pnl", "unrealized_pnl", "open_notional", "account_value", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet"})
             self.assertGreaterEqual(status["rejects_today"], 1)
     def test_paper_follower_entry_and_exit_rows_include_book_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
@@ -266,6 +266,65 @@ class CoreTests(unittest.TestCase):
             msg = render_trade_webhook(entry, {"account_value": 100, "open_notional": 100, "realized_pnl": 0})
             self.assertIn("PAPER BUY", msg)
             self.assertIn("Paper account value", msg)
+
+    def test_wallet_driven_token_added_on_unmatched_trade(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = ArchiveConfig(archive_dir=root, state_path=root / "state.json", followup_queue_path=root / "followups.json", max_tokens=400)
+            daemon = BookArchiveDaemon(cfg)
+            trade = {"asset": "0xnewtoken", "side": "BUY", "price": 0.5, "size": 10, "timestamp": 100, "conditionId": "0xcond"}
+            daemon._ensure_wallet_trade_tokens(trade)
+            self.assertIn("0xnewtoken", daemon.wallet_driven_tokens)
+            self.assertIn("0xcond", daemon.wallet_driven_condition_ids)
+            self.assertEqual(len(daemon.token_meta), 1)
+
+    def test_eviction_removes_old_non_wallet_tokens_first(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = ArchiveConfig(archive_dir=root, state_path=root / "state.json", followup_queue_path=root / "followups.json", max_tokens=10)
+            daemon = BookArchiveDaemon(cfg)
+            # Add 8 wallet-driven tokens
+            for i in range(8):
+                tid = f"wallet_{i}"
+                daemon.wallet_driven_tokens.add(tid)
+                daemon.token_meta[tid] = {"token_id": tid, "wallet_driven": True}
+            # Add 5 top-50 baseline tokens
+            for i in range(5):
+                tid = f"base_{i}"
+                daemon.token_meta[tid] = {"token_id": tid}
+            daemon._evict_excess_tokens()
+            self.assertLessEqual(len(daemon.token_meta), 10)
+            # All wallet-driven tokens survive
+            for i in range(8):
+                self.assertIn(f"wallet_{i}", daemon.token_meta)
+            # Only 2 baseline tokens survive (8 + 2 = 10)
+            baseline_survivors = [tid for tid in daemon.token_meta if tid.startswith("base_")]
+            self.assertEqual(len(baseline_survivors), 2)
+
+    def test_daily_entry_cap_replaces_daily_signal_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = root / "archive"
+            paper = root / "paper"
+            archive.mkdir(); paper.mkdir()
+            cfg = PaperConfig(paper_dir=paper, ledger_path=paper / "ledger.jsonl", state_path=paper / "state.json", allowlist_path=paper / "allowlist.json", data_quality_path=paper / "data_quality.json", max_ws_age_seconds=999999999, max_signals_per_day=2)
+            cfg.allowlist_path.write_text(json.dumps({"wallets": ["0xw"]}))
+            acfg = ArchiveConfig(archive_dir=archive, state_path=root / "shadow_state.json", followup_queue_path=archive / "followups.json")
+            daemon = PaperFollowerDaemon(cfg, acfg)
+            book = {"token_id": "tok1", "best_bid": 0.49, "best_ask": 0.5, "best_bid_size": 1000, "best_ask_size": 1000, "spread": 0.01, "top3_asks": [{"price": 0.5, "size": 1000}], "top3_bids": [{"price": 0.49, "size": 1000}]}
+            # First fill -> entry (accepts_today=0)
+            buy1 = {"ts": "2026-01-01T00:00:00+00:00", "wallet": "0xw", "trade_id": "buy1", "fill_timestamp": "2026-01-01T00:00:00+00:00", "fill_side": "BUY", "fill_price": 0.5, "trade": {"asset": "tok1", "side": "BUY", "timestamp": "2026-01-01T00:00:00+00:00", "price": 0.5, "conditionId": "m1"}, "book_at_detection": book}
+            r1 = daemon.process_fill(buy1, 0)
+            self.assertEqual(r1[1]["type"], "entry")
+            # Second fill -> entry (accepts_today=1)
+            buy2 = {"ts": "2026-01-01T00:00:01+00:00", "wallet": "0xw", "trade_id": "buy2", "fill_timestamp": "2026-01-01T00:00:01+00:00", "fill_side": "BUY", "fill_price": 0.5, "trade": {"asset": "tok2", "side": "BUY", "timestamp": "2026-01-01T00:00:01+00:00", "price": 0.5, "conditionId": "m2"}, "book_at_detection": book}
+            r2 = daemon.process_fill(buy2, 1)
+            self.assertEqual(r2[1]["type"], "entry")
+            # Third fill -> reject daily_entry_cap (accepts_today=2, cap=2)
+            buy3 = {"ts": "2026-01-01T00:00:02+00:00", "wallet": "0xw", "trade_id": "buy3", "fill_timestamp": "2026-01-01T00:00:02+00:00", "fill_side": "BUY", "fill_price": 0.5, "trade": {"asset": "tok3", "side": "BUY", "timestamp": "2026-01-01T00:00:02+00:00", "price": 0.5, "conditionId": "m3"}, "book_at_detection": book}
+            r3 = daemon.process_fill(buy3, 2)
+            self.assertEqual(r3[1]["type"], "reject")
+            self.assertIn("daily_entry_cap", r3[1]["reject_reason"])
 
 
 if __name__ == "__main__":

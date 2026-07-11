@@ -34,7 +34,7 @@ class PaperConfig:
     stale_fill_seconds: float = 120.0
     max_ws_age_seconds: float = 60.0
     haircut: float = 0.005
-    poll_interval_seconds: float = 5.0
+    poll_interval_seconds: float = 3.0
     stale_position_days: int = 14
 
     @classmethod
@@ -318,14 +318,12 @@ def market_resolution_soon(book: dict[str, Any], now: datetime) -> bool:
     return False
 
 
-def reject_reasons(row: dict[str, Any], cfg: PaperConfig, archive_cfg: ArchiveConfig, state: dict[str, Any], signals_today: int) -> list[str]:
+def reject_reasons(row: dict[str, Any], cfg: PaperConfig, archive_cfg: ArchiveConfig, state: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
     wallet = str(row.get("wallet") or "").lower()
     allowlist = load_allowlist(cfg.allowlist_path)
     if wallet not in allowlist:
         reasons.append("wallet_not_allowlisted")
-    if signals_today >= cfg.max_signals_per_day:
-        reasons.append("daily_signal_cap")
     fill_ts = parse_ts(row.get("fill_timestamp") or (row.get("trade") or {}).get("timestamp"))
     detect_ts = parse_ts(row.get("ts")) or utc_now()
     if fill_ts and (detect_ts - fill_ts).total_seconds() > cfg.stale_fill_seconds:
@@ -392,7 +390,7 @@ class PaperFollowerDaemon:
             "trade_id": tid,
         }
 
-    def process_fill(self, row: dict[str, Any], signals_today: int) -> list[dict[str, Any]]:
+    def process_fill(self, row: dict[str, Any], accepts_today: int) -> list[dict[str, Any]]:
         trade = row.get("trade") if isinstance(row.get("trade"), dict) else {}
         tid = str(row.get("trade_id") or trade_id(trade))
         if tid in set(self.state.get("processed_trade_ids", [])):
@@ -401,7 +399,7 @@ class PaperFollowerDaemon:
         fill_ts = parse_ts(row.get("fill_timestamp") or trade.get("timestamp"))
         latency = (detect_ts - fill_ts).total_seconds() if fill_ts else None
         out = [self.signal_row(row, tid, latency)]
-        reasons = reject_reasons(row, self.cfg, self.archive_cfg, self.state, signals_today)
+        reasons = reject_reasons(row, self.cfg, self.archive_cfg, self.state)
         wallet = str(row.get("wallet") or "").lower()
         book = row.get("book_at_detection") if isinstance(row.get("book_at_detection"), dict) else {}
         snap = book_snapshot(book)
@@ -409,6 +407,9 @@ class PaperFollowerDaemon:
         side = side_norm(row.get("fill_side") or trade.get("side"))
         if reasons:
             rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": ",".join(reasons), "book_snapshot": snap})
+            out.append(rej)
+        elif accepts_today >= self.cfg.max_signals_per_day:
+            rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": "daily_entry_cap", "book_snapshot": snap})
             out.append(rej)
         elif side == "SELL":
             pos_id = position_key(wallet, token)
@@ -438,13 +439,18 @@ class PaperFollowerDaemon:
     def process_once(self) -> int:
         today = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
         existing = read_jsonl(self.cfg.ledger_path)
-        signals_today = sum(1 for r in existing if r.get("type") == "signal" and (parse_ts(r.get("ts")) or today) >= today)
+        accepts_today = sum(1 for r in existing if r.get("type") == "entry" and (parse_ts(r.get("ts")) or today) >= today)
         wrote = 0
         notify_rows: list[dict[str, Any]] = []
         for fill in iter_shadow_fills(self.archive_cfg):
-            rows = self.process_fill(fill, signals_today)
+            rows = self.process_fill(fill, accepts_today)
             if rows:
-                signals_today += 1
+                signal_present = any(r.get("type") == "signal" for r in rows)
+                entry_present = any(r.get("type") == "entry" for r in rows)
+                if entry_present:
+                    accepts_today += 1
+                elif not signal_present:
+                    pass
             for row in rows:
                 append_jsonl_fsync(self.cfg.ledger_path, row)
                 if row.get("type") in {"entry", "exit"}:
@@ -464,10 +470,13 @@ class PaperFollowerDaemon:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: self.stop())
         while self.running:
+            cycle_start = time.time()
             wrote = self.process_once()
+            elapsed = time.time() - cycle_start
             if wrote:
-                LOG.info("paper follower wrote ledger rows=%s", wrote)
-            time.sleep(self.cfg.poll_interval_seconds)
+                LOG.info("paper follower wrote ledger rows=%s cycle=%.3fs", wrote, elapsed)
+            sleep_left = max(0.0, self.cfg.poll_interval_seconds - elapsed)
+            time.sleep(sleep_left)
 
     def stop(self) -> None:
         self.running = False
@@ -505,6 +514,10 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
     open_notional = sum(num(pos.get("cost_usd"), 0) for pos in positions.values() if isinstance(pos, dict))
     unrealized = 0.0
     account_value = realized + unrealized + open_notional
+    sorted_lat = sorted(latencies)
+    n = len(sorted_lat)
+    latency_p50 = sorted_lat[n // 2] if n else 0.0
+    latency_p90 = sorted_lat[int(n * 0.9)] if n else 0.0
     return {
         "positions_open": len(positions),
         "signals_today": len(signals),
@@ -516,6 +529,9 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
         "open_notional": round(open_notional, 4),
         "account_value": round(account_value, 4),
         "avg_detection_latency_s": round(sum(latencies) / len(latencies), 3) if latencies else 0.0,
+        "detection_latency_p50": round(latency_p50, 3),
+        "detection_latency_p90": round(latency_p90, 3),
+        "poll_interval_s": cfg.poll_interval_seconds,
         "per_wallet": sorted(per.values(), key=lambda x: x["signals"], reverse=True),
     }
 

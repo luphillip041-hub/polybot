@@ -10,6 +10,7 @@
   "followup_offsets_seconds": [60, 300, 900],
   "max_write_interval_per_token_seconds": 30,
   "heartbeat_interval_seconds": 60,
+  "max_tokens": 400,
   "archive_dir": "/root/flip/projects/polymarket-copybot/runs/book_archive",
   "state_path": "/root/flip/projects/polymarket-copybot/runs/shadow_journal_state.json",
   "followup_queue_path": "/root/flip/projects/polymarket-copybot/runs/book_archive/followup_queue.json"
