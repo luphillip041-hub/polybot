@@ -136,6 +136,7 @@ class BookArchiveDaemon:
         self.wallet_driven_tokens: set[str] = set()
         self.wallet_driven_condition_ids: set[str] = set()
         self.wallet_trade_seen_tokens: set[str] = set()
+        self._ws_reconnect_requested: bool = False
         self._mark_startup_missed_followups()
 
     def _load_state(self) -> dict[str, Any]:
@@ -319,6 +320,7 @@ class BookArchiveDaemon:
         if condition_id:
             self.wallet_driven_condition_ids.add(str(condition_id).lower())
         self.token_meta[token_id] = {"token_id": token_id, "wallet_driven": True}
+        self._ws_reconnect_requested = True
         LOG.info("universe_add token=%s wallet_driven=%s condition_id=%s tokens_total=%s", token_id[:12], True, condition_id, len(self.token_meta))
 
     def _restore_wallet_driven_tokens(self) -> None:
@@ -440,6 +442,10 @@ class BookArchiveDaemon:
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8", "ignore")
                         self.handle_ws_message(raw)
+                        if self._ws_reconnect_requested:
+                            self._ws_reconnect_requested = False
+                            LOG.info("ws_reconnect_requested tokens=%s subscribing new tokens", len(self.token_meta))
+                            break
             except asyncio.TimeoutError:
                 end_ts = iso_now()
                 start_ts = self.last_ws_message_ts or last_disconnect_ts or end_ts
