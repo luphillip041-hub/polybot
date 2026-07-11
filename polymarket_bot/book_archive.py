@@ -19,6 +19,7 @@ from .archive_config import ArchiveConfig
 from .clob import order_book
 from .data import user_trades
 from .gamma import active_events, flatten_markets
+from .http import ApiError
 from .paper import write_json
 
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -137,6 +138,7 @@ class BookArchiveDaemon:
         self.wallet_driven_condition_ids: set[str] = set()
         self.wallet_trade_seen_tokens: set[str] = set()
         self._wallet_seed_done: bool = False
+        self._snapshot_failed_tokens: set[str] = set()
         self._ws_reconnect_requested: bool = False
         self._mark_startup_missed_followups()
 
@@ -419,11 +421,22 @@ class BookArchiveDaemon:
         return row
 
     def rest_snapshot_once(self) -> None:
+        max_wallet_per_cycle = 20
+        wallet_snapped = 0
         for token_id in list(self.token_meta):
+            if token_id in self._snapshot_failed_tokens:
+                continue
+            if token_id in self.wallet_driven_tokens and wallet_snapped >= max_wallet_per_cycle:
+                continue
             try:
                 book = order_book(token_id)
                 self.record_book(token_id, book.get("bids") or [], book.get("asks") or [], source="rest_snapshot", event_type="snapshot", force=True)
                 self.stats.rest_snapshots += 1
+                if token_id in self.wallet_driven_tokens:
+                    wallet_snapped += 1
+            except ApiError:
+                self._snapshot_failed_tokens.add(token_id)
+                LOG.warning("REST snapshot dead token=%s", token_id[:12])
             except Exception:
                 LOG.exception("REST snapshot failed token=%s", token_id)
 
@@ -705,6 +718,7 @@ class BookArchiveDaemon:
     async def run(self) -> None:
         self.discover_markets()
         self._seed_wallet_driven_tokens_30d()
+        self._evict_excess_tokens()
         self.rest_snapshot_once()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
