@@ -15,7 +15,7 @@ class ArchiveConfig:
     top_n_markets: int = 50
     gamma_event_limit: int = 200
     snapshot_interval_seconds: int = 30
-    wallet_poll_interval_seconds: int = 60
+    wallet_poll_interval_seconds: int = 15
     retention_days: int = 45
     tracked_wallets: list[str] = field(default_factory=list)
     tracked_wallet_limit_from_scores: int = 25

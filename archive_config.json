@@ -2,7 +2,7 @@
   "top_n_markets": 50,
   "gamma_event_limit": 250,
   "snapshot_interval_seconds": 30,
-  "wallet_poll_interval_seconds": 60,
+  "wallet_poll_interval_seconds": 15,
   "retention_days": 45,
   "tracked_wallets": [],
   "tracked_wallet_limit_from_scores": 25,

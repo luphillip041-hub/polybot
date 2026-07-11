@@ -544,6 +544,12 @@ class BookArchiveDaemon:
                 self.stats.wallet_trades_seen += 1
                 tid = trade_id(trade)
                 seen.add(tid)
+                # Log per-fill detection latency: poller_seen_ts - fill_ts
+                fill_ts = self._trade_timestamp(trade)
+                poller_seen_ts = time.time()
+                if fill_ts:
+                    detection_latency = poller_seen_ts - fill_ts
+                    LOG.debug("wallet fill latency wallet=%s trade_id=%s latency=%.1fs", wallet, tid[:12], detection_latency)
                 # Ensure wallet trade tokens are in the archive universe
                 self._ensure_wallet_trade_tokens(trade)
                 if tid in journaled:
@@ -604,8 +610,12 @@ class BookArchiveDaemon:
 
     async def wallet_loop(self) -> None:
         while self.running:
+            cycle_start = time.time()
             self.poll_wallets_once()
-            await self._sleep(self.config.wallet_poll_interval_seconds)
+            elapsed = time.time() - cycle_start
+            LOG.info("wallet poll cycle=%.3fs", elapsed)
+            sleep_left = max(0.0, self.config.wallet_poll_interval_seconds - elapsed)
+            await self._sleep(sleep_left)
 
     def apply_retention(self) -> None:
         cutoff = utc_now() - timedelta(days=self.config.retention_days)
