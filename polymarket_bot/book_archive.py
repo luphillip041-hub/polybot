@@ -138,7 +138,7 @@ class BookArchiveDaemon:
         self.wallet_driven_condition_ids: set[str] = set()
         self.wallet_trade_seen_tokens: set[str] = set()
         self._wallet_seed_done: bool = False
-        self._snapshot_failed_tokens: set[str] = set()
+        self._snapshot_failed_tokens: dict[str, int] = {}
         self._ws_reconnect_requested: bool = False
         self._mark_startup_missed_followups()
 
@@ -420,23 +420,75 @@ class BookArchiveDaemon:
         LOG.warning("gap marker reason=%s tokens=%s start=%s end=%s", reason, len(tokens_affected), start_ts, end_ts)
         return row
 
+    def _evict_dead_token(self, token_id: str, reason: str = "dead") -> None:
+        """Remove a dead token from the archive universe permanently."""
+        if token_id in self.token_meta:
+            self.token_meta.pop(token_id, None)
+        self.wallet_driven_tokens.discard(token_id)
+        self._snapshot_failed_tokens.pop(token_id, None)
+        self.stats.tokens_covered = len(self.token_meta)
+        LOG.info("universe_evict token=%s wallet_driven=True reason=%s tokens_after=%s", token_id[:12], reason, len(self.token_meta))
+
     def rest_snapshot_once(self) -> None:
         max_wallet_per_cycle = 20
         wallet_snapped = 0
+        FAIL_THRESHOLD = 3
+
+        # First pass: snapshot baseline (non-wallet-driven) tokens
         for token_id in list(self.token_meta):
-            if token_id in self._snapshot_failed_tokens:
-                continue
-            if token_id in self.wallet_driven_tokens and wallet_snapped >= max_wallet_per_cycle:
+            if token_id in self.wallet_driven_tokens:
                 continue
             try:
                 book = order_book(token_id)
                 self.record_book(token_id, book.get("bids") or [], book.get("asks") or [], source="rest_snapshot", event_type="snapshot", force=True)
                 self.stats.rest_snapshots += 1
-                if token_id in self.wallet_driven_tokens:
-                    wallet_snapped += 1
             except ApiError:
-                self._snapshot_failed_tokens.add(token_id)
-                LOG.warning("REST snapshot dead token=%s", token_id[:12])
+                self._snapshot_failed_tokens[token_id] = self._snapshot_failed_tokens.get(token_id, 0) + 1
+                LOG.warning("REST snapshot dead baseline token=%s", token_id[:12])
+            except Exception:
+                LOG.exception("REST snapshot failed baseline token=%s", token_id)
+
+        # Second pass: retry previously-failed wallet tokens (count toward snapshot limit)
+        for token_id in sorted(self._snapshot_failed_tokens.keys()):
+            if token_id not in self.token_meta or token_id not in self.wallet_driven_tokens:
+                self._snapshot_failed_tokens.pop(token_id, None)
+                continue
+            if wallet_snapped >= max_wallet_per_cycle:
+                break
+            try:
+                book = order_book(token_id)
+                self.record_book(token_id, book.get("bids") or [], book.get("asks") or [], source="rest_snapshot", event_type="snapshot", force=True)
+                self.stats.rest_snapshots += 1
+                wallet_snapped += 1
+                self._snapshot_failed_tokens.pop(token_id, None)
+            except ApiError:
+                count = self._snapshot_failed_tokens.get(token_id, 0) + 1
+                self._snapshot_failed_tokens[token_id] = count
+                wallet_snapped += 1
+                if count >= FAIL_THRESHOLD:
+                    self._evict_dead_token(token_id, "dead")
+                else:
+                    LOG.warning("REST snapshot dead token=%s attempt=%d/%d", token_id[:12], count, FAIL_THRESHOLD)
+            except Exception:
+                LOG.exception("REST snapshot failed token=%s", token_id)
+
+        # Third pass: try new wallet-driven tokens (never snapped before)
+        for token_id in list(self.token_meta):
+            if token_id not in self.wallet_driven_tokens:
+                continue
+            if token_id in self._snapshot_failed_tokens:
+                continue
+            if wallet_snapped >= max_wallet_per_cycle:
+                break
+            try:
+                book = order_book(token_id)
+                self.record_book(token_id, book.get("bids") or [], book.get("asks") or [], source="rest_snapshot", event_type="snapshot", force=True)
+                self.stats.rest_snapshots += 1
+                wallet_snapped += 1
+            except ApiError:
+                self._snapshot_failed_tokens[token_id] = self._snapshot_failed_tokens.get(token_id, 0) + 1
+                wallet_snapped += 1
+                LOG.warning("REST snapshot dead token=%s attempt=1/%d", token_id[:12], FAIL_THRESHOLD)
             except Exception:
                 LOG.exception("REST snapshot failed token=%s", token_id)
 
