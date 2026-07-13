@@ -135,7 +135,6 @@ class BookArchiveDaemon:
         self.last_ws_message_ts: str | None = None
         self.ws_stale_timeout_seconds = float(os.getenv("POLYMARKET_WS_STALE_TIMEOUT_SECONDS", "60"))
         self.wallet_driven_tokens: set[str] = set()
-        self.wallet_driven_condition_ids: set[str] = set()
         self.wallet_trade_seen_tokens: set[str] = set()
         self._wallet_seed_done: bool = False
         self._snapshot_failed_tokens: dict[str, int] = {}
@@ -310,7 +309,7 @@ class BookArchiveDaemon:
         self._restore_wallet_driven_tokens()
         # Apply token ceiling
         self._evict_excess_tokens()
-        self.stats.markets_covered = len(selected) + len(self.wallet_driven_condition_ids)
+        self.stats.markets_covered = len(selected)
         self.stats.tokens_covered = len(self.token_meta)
         write_json(self.config.archive_dir / "markets_latest.json", {"ts": iso_now(), "markets": selected, "tokens": self.token_meta})
         LOG.info("discovered markets=%s tokens=%s wallet_driven_tokens=%s", len(selected), self.stats.tokens_covered, len(self.wallet_driven_tokens))
@@ -320,8 +319,6 @@ class BookArchiveDaemon:
         if token_id in self.token_meta or token_id in self.wallet_driven_tokens:
             return
         self.wallet_driven_tokens.add(token_id)
-        if condition_id:
-            self.wallet_driven_condition_ids.add(str(condition_id).lower())
         self.token_meta[token_id] = {"token_id": token_id, "wallet_driven": True}
         self._ws_reconnect_requested = True
         LOG.info("universe_add token=%s wallet_driven=%s condition_id=%s tokens_total=%s", token_id[:12], True, condition_id, len(self.token_meta))
@@ -562,9 +559,7 @@ class BookArchiveDaemon:
 
     def _configured_wallets(self) -> list[str]:
         wallets = [w.lower() for w in self.config.tracked_wallets if w]
-        scores_path = Path("runs/wallet_scores_latest.json")
-        if not scores_path.is_absolute():
-            scores_path = Path(__file__).resolve().parents[1] / scores_path
+        scores_path = self.config.archive_dir.parent / "wallet_scores_latest.json"
         if scores_path.exists() and len(wallets) < self.config.tracked_wallet_limit_from_scores:
             try:
                 rows = json.loads(scores_path.read_text())
@@ -593,9 +588,7 @@ class BookArchiveDaemon:
         token = self._trade_token(trade)
         if token:
             return self.book_state.get(token)
-        slug = trade.get("marketSlug") or trade.get("slug")
-        candidates = [state for _tid, state in self.book_state.items() if not slug or state.get("market", {}).get("market_slug") == slug]
-        return {"tokens": candidates, "ts": iso_now()} if candidates else None
+        return None
 
     def _trade_timestamp(self, trade: dict[str, Any]) -> float | None:
         raw = trade.get("timestamp") or trade.get("createdAt") or trade.get("created_at")

@@ -6,7 +6,6 @@ import logging
 import os
 import signal
 import time
-import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -585,7 +584,7 @@ def post_discord_webhook(url: str, content: str) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
             return 200 <= resp.status < 300
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except Exception:
         LOG.exception("paper webhook post failed")
         return False
 

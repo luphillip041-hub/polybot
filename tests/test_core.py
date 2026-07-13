@@ -275,7 +275,6 @@ class CoreTests(unittest.TestCase):
             trade = {"asset": "0xnewtoken", "side": "BUY", "price": 0.5, "size": 10, "timestamp": 100, "conditionId": "0xcond"}
             daemon._ensure_wallet_trade_tokens(trade)
             self.assertIn("0xnewtoken", daemon.wallet_driven_tokens)
-            self.assertIn("0xcond", daemon.wallet_driven_condition_ids)
             self.assertEqual(len(daemon.token_meta), 1)
 
     def test_eviction_removes_old_non_wallet_tokens_first(self):
@@ -300,6 +299,26 @@ class CoreTests(unittest.TestCase):
             # Only 2 baseline tokens survive (8 + 2 = 10)
             baseline_survivors = [tid for tid in daemon.token_meta if tid.startswith("base_")]
             self.assertEqual(len(baseline_survivors), 2)
+
+    def test_configured_wallets_resolves_path_via_archive_dir_parent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = root / "book_archive"
+            archive.mkdir()
+            # Write a scores file in the parent dir (the runs root)
+            scores = root / "wallet_scores_latest.json"
+            scores.write_text(json.dumps([{"wallet": "0xscores_wallet", "user_name": "scorebot"}]))
+            cfg = ArchiveConfig(
+                archive_dir=archive,
+                state_path=root / "state.json",
+                followup_queue_path=root / "followups.json",
+                tracked_wallets=["0xtracked_wallet"],
+                tracked_wallet_limit_from_scores=5,
+            )
+            daemon = BookArchiveDaemon(cfg)
+            wallets = daemon._configured_wallets()
+            self.assertIn("0xtracked_wallet", wallets)
+            self.assertIn("0xscores_wallet", wallets)
 
     def test_daily_entry_cap_replaces_daily_signal_cap(self):
         with tempfile.TemporaryDirectory() as td:
