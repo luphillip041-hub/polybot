@@ -73,3 +73,60 @@ def _num(value: Any) -> float:
         return float(value)
     except Exception:
         return 0.0
+
+
+def markets_by_token(token_id: str, config: BotConfig = CONFIG) -> list[dict[str, Any]]:
+    """Look up the Gamma market entry for a given CLOB token id.
+
+    Returns a list (most-Gamma endpoints return arrays even for one-shot queries).
+    An empty list means no market row exists for this token.
+    """
+    if not token_id:
+        return []
+    try:
+        data = get_json(config.gamma_base, "/markets", {"clob_token_ids": token_id}, user_agent=config.user_agent)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def resolved_outcome_for_token(token_id: str, config: BotConfig = CONFIG) -> dict[str, Any] | None:
+    """Look up resolution status for the market that contains this token.
+
+    Returns a dict like:
+      {"resolved": True/False, "side": "YES"|"NO"|None, "question": ..., "market_id": ..., "closed": bool}
+
+    Returns None if lookup failed or token is unknown to Gamma.
+    Side is the outcome *our* token represents (YES or NO) so caller can price a long correctly.
+    """
+    markets = markets_by_token(token_id, config=config)
+    if not markets:
+        return None
+    market = markets[0] if isinstance(markets[0], dict) else {}
+    closed = bool(market.get("closed"))
+    resolution_status = market.get("umaResolutionStatus") or market.get("resolution")
+    clob_ids = _parse_array(market.get("clobTokenIds"))
+    token_lower = token_id.lower()
+    side: str | None = None
+    for idx, cid in enumerate(clob_ids):
+        if str(cid).lower() == token_lower:
+            outcomes = _parse_array(market.get("outcomes"))
+            if idx < len(outcomes):
+                outcome_label = str(outcomes[idx]).strip().upper()
+                if outcome_label in {"YES", "NO", "TRUE", "FALSE"}:
+                    side = "YES" if outcome_label in {"YES", "TRUE"} else "NO"
+                else:
+                    # Multi-outcome markets — caller may need to inspect manually
+                    side = outcome_label
+            break
+    return {
+        "resolved": bool(closed and resolution_status),
+        "resolution_status": resolution_status,
+        "side": side,
+        "question": market.get("question"),
+        "market_id": market.get("id"),
+        "condition_id": market.get("conditionId") or market.get("condition_id"),
+        "closed": closed,
+        "active": market.get("active"),
+        "raw": market,
+    }

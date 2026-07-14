@@ -14,6 +14,8 @@ from typing import Any
 
 from .archive_config import ArchiveConfig
 from .book_archive import trade_id
+from .config import BotConfig
+from .gamma import resolved_outcome_for_token
 
 LOG = logging.getLogger("polymarket_paper_follower")
 
@@ -35,6 +37,7 @@ class PaperConfig:
     haircut: float = 0.005
     poll_interval_seconds: float = 3.0
     stale_position_days: int = 14
+    resolution_poll_seconds: float = float(os.getenv("POLYMARKET_RESOLUTION_POLL_SECONDS", "1800"))
 
     @classmethod
     def load(cls) -> "PaperConfig":
@@ -367,6 +370,8 @@ class PaperFollowerDaemon:
             self.state["processed_trade_ids"] = [str(r.get("trade_id") or trade_id(r.get("trade") or {})) for r in iter_shadow_fills(self.archive_cfg)]
             save_state(self.cfg.state_path, self.state)
         self.running = True
+        self._last_resolution_at = time.time()
+        self._resolution_summary: dict[str, Any] = {"last_checked_at": None, "checked": 0, "resolved": 0, "skipped": 0}
 
     def signal_row(self, row: dict[str, Any], tid: str, latency: float | None) -> dict[str, Any]:
         trade = row.get("trade") if isinstance(row.get("trade"), dict) else {}
@@ -465,12 +470,31 @@ class PaperFollowerDaemon:
                     post_discord_webhook(webhook_url, message)
         return wrote
 
+    def process_resolution_once(self, *, force: bool = False) -> dict[str, Any] | None:
+        """Run a single resolution cycle if the throttle window has elapsed (or force=True).
+
+        Returns the summary dict on a real cycle, None if throttled.
+        """
+        now = time.time()
+        interval = float(self.cfg.resolution_poll_seconds or 1800)
+        if not force and (now - self._last_resolution_at) < interval:
+            return None
+        self._last_resolution_at = now
+        try:
+            summary = run_resolution_cycle(self.state, self.cfg)
+        except Exception:
+            LOG.exception("resolution cycle failed")
+            return {"checked": 0, "resolved": 0, "skipped": 0, "last_checked_at": iso_now(), "error": True}
+        self._resolution_summary = summary
+        return summary
+
     def run(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: self.stop())
         while self.running:
             cycle_start = time.time()
             wrote = self.process_once()
+            self.process_resolution_once(force=False)
             elapsed = time.time() - cycle_start
             if wrote:
                 LOG.info("paper follower wrote ledger rows=%s cycle=%.3fs", wrote, elapsed)
@@ -529,6 +553,8 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
             entries_by_latency["120-300s"] += 1
         else:
             entries_by_latency[">300s"] += 1
+    # Realized PnL today (closes today) vs all-time
+    realized_today = sum(num(r.get("pnl"), 0) for r in rows if r.get("type") in {"exit", "resolution"} and (parse_ts(r.get("ts")) or today) >= today)
     return {
         "positions_open": len(positions),
         "signals_today": len(signals),
@@ -537,6 +563,7 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
         "rejects_today": len(rejects),
         "rejects_by_reason": rejects_by_reason,
         "realized_pnl": round(realized, 4),
+        "realized_pnl_today": round(realized_today, 4),
         "unrealized_pnl": round(unrealized, 4),
         "open_notional": round(open_notional, 4),
         "account_value": round(account_value, 4),
@@ -548,12 +575,160 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
     }
 
 
+def render_resolution_webhook(row: dict[str, Any], status: dict[str, Any]) -> str | None:
+    """Webhook formatter for resolution exits — reuses the entry/exit card shape."""
+    return render_trade_webhook(row, status)
+
+
+def resolution_exit_price(side: str | None, outcome_status: str | object) -> float | None:
+    """Translate a Gamma resolution status + token-side into an exit price.
+
+    YES token (we hold) settles at 1.00 if YES won, 0.00 if NO won.
+    NO token (we hold) settles at 1.00 if NO won, 0.00 if YES won.
+
+    Returns None if we can't infer the side (multi-outcome / unknown).
+    """
+    status_upper = str(outcome_status or "").strip().upper()
+    if status_upper in {"", "UNKNOWN", "NONE"}:
+        return None
+    side_upper = str(side or "").strip().upper()
+    if side_upper == "YES":
+        if status_upper in {"YES", "TRUE", "1", "1.0"}:
+            return 1.0
+        if status_upper in {"NO", "FALSE", "0", "0.0"}:
+            return 0.0
+        # Some markets use outcomes array positions; treat non-matching labels as unknown
+        return None
+    if side_upper == "NO":
+        if status_upper in {"NO", "FALSE", "0", "0.0"}:
+            return 1.0
+        if status_upper in {"YES", "TRUE", "1", "1.0"}:
+            return 0.0
+    return None
+
+
+def check_positions_for_resolution(state: dict[str, Any], config: BotConfig | None = None) -> list[dict[str, Any]]:
+    """For each open position, attempt resolution lookup. Returns actions to take.
+
+    Each action is one of:
+      {"action": "resolve", "pos_id": ..., "exit_price": 1.0|0.0, "question": ..., "side": ...}
+      {"action": "skip",    "pos_id": ..., "reason": "not_resolved"}
+    """
+    from .config import CONFIG as _default_cfg
+    effective_cfg: BotConfig = config if isinstance(config, BotConfig) else _default_cfg  # type: ignore[assignment]
+    positions = state.get("positions", {}) if isinstance(state.get("positions"), dict) else {}
+    actions: list[dict[str, Any]] = []
+    for pos_id, pos in positions.items():
+        if not isinstance(pos, dict):
+            continue
+        token = str(pos.get("token") or "")
+        if not token:
+            actions.append({"action": "skip", "pos_id": pos_id, "reason": "no_token"})
+            continue
+        info = resolved_outcome_for_token(token, config=effective_cfg)
+        if info is None:
+            actions.append({"action": "skip", "pos_id": pos_id, "reason": "gamma_unknown"})
+            continue
+        if not info.get("resolved"):
+            actions.append({"action": "skip", "pos_id": pos_id, "reason": "not_resolved"})
+            continue
+        exit_price = resolution_exit_price(info.get("side"), info.get("resolution_status"))
+        if exit_price is None:
+            actions.append({"action": "skip", "pos_id": pos_id, "reason": "unmappable_outcome", "info": info})
+            continue
+        actions.append({
+            "action": "resolve",
+            "pos_id": pos_id,
+            "exit_price": exit_price,
+            "question": info.get("question"),
+            "side": info.get("side"),
+            "market_id": info.get("market_id"),
+        })
+    return actions
+
+
+def apply_resolution(state: dict[str, Any], action: dict[str, Any]) -> dict[str, Any] | None:
+    """Pop the position from state and build a ledger exit/resolution row.
+
+    Returns the row dict (caller persists it). Returns None if position was already gone.
+    """
+    pos_id = action.get("pos_id")
+    if not pos_id:
+        return None
+    pos = state.get("positions", {}).pop(pos_id, None)
+    if not pos:
+        return None
+    entry_price = num(pos.get("entry_price"), 0.0)
+    shares = num(pos.get("shares"), 0.0)
+    cost_usd = num(pos.get("cost_usd"), 0.0)
+    exit_price = float(action.get("exit_price") or 0.0)
+    proceeds = shares * exit_price
+    pnl = proceeds - cost_usd
+    return {
+        "ts": iso_now(),
+        "type": "resolution",
+        "wallet": pos.get("wallet"),
+        "market": action.get("question") or "resolved",
+        "token": pos.get("token"),
+        "side": "BUY",  # paper follower is long-only
+        "detection_latency_s": None,
+        "wallet_fill_price": entry_price,
+        "sim_fill_price": exit_price,
+        "sim_size": shares,
+        "reject_reason": None,
+        "position_id": pos_id,
+        "pnl": pnl,
+        "book_snapshot": None,
+        "trade_id": None,
+        "resolution_side": action.get("side"),
+        "resolution_market_id": action.get("market_id"),
+    }
+
+
+def run_resolution_cycle(state: dict[str, Any], cfg: PaperConfig, config: BotConfig | None = None) -> dict[str, Any]:
+    """Check all open positions for resolution; persist exit rows and fire webhook.
+
+    Returns a summary dict with resolution-side stats for the API surface.
+    """
+    from .config import CONFIG as _default_cfg
+    cfg_bot: BotConfig = config if isinstance(config, BotConfig) else _default_cfg  # type: ignore[assignment]
+    actions = check_positions_for_resolution(state, config=cfg_bot)
+    summary: dict[str, Any] = {
+        "checked": len(actions),
+        "resolved": 0,
+        "skipped": 0,
+        "exit_rows": [],
+    }
+    webhook_url = os.getenv("POLYMARKET_PAPER_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK_URL")
+    for action in actions:
+        if action.get("action") == "resolve":
+            row = apply_resolution(state, action)
+            if row is None:
+                summary["skipped"] += 1
+                continue
+            append_jsonl_fsync(cfg.ledger_path, row)
+            summary["exit_rows"].append(row)
+            summary["resolved"] += 1
+            LOG.info("resolution exit pos=%s exit=%.4f pnl=%.2f question=%s", row["position_id"], row["sim_fill_price"], row["pnl"], row["market"])
+        else:
+            summary["skipped"] += 1
+    save_state(cfg.state_path, state)
+    if webhook_url and summary["exit_rows"]:
+        status = paper_status(cfg)
+        for row in summary["exit_rows"]:
+            message = render_trade_webhook(row, status)
+            if message:
+                post_discord_webhook(webhook_url, message)
+    summary["last_checked_at"] = iso_now()
+    return summary
+
+
 def render_trade_webhook(row: dict[str, Any], status: dict[str, Any]) -> str | None:
     kind = str(row.get("type") or "")
-    if kind not in {"entry", "exit"}:
+    if kind not in {"entry", "exit", "resolution"}:
         return None
     emoji = "🟢" if kind == "entry" else "🔴"
-    label = "PAPER BUY" if kind == "entry" else "PAPER SELL"
+    label = "PAPER BUY" if kind == "entry" else "PAPER SELL" if kind == "exit" else "MARKET RESOLVED"
     wallet = str(row.get("wallet") or "unknown")
     market = str(row.get("market") or "unknown")
     token = str(row.get("token") or "")

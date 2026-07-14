@@ -14,7 +14,20 @@ from polymarket_bot.book_archive import normalize_levels, bbo_from_levels, trade
 import polymarket_bot.book_archive as book_archive_module
 from polymarket_bot.archive_config import ArchiveConfig
 from polymarket_bot.status_api import RollingState, duration_s
-from polymarket_bot.paper_follower import PaperConfig, PaperFollowerDaemon, paper_status, read_jsonl, render_trade_webhook, simulate_fill
+from polymarket_bot.paper_follower import (
+    PaperConfig,
+    PaperFollowerDaemon,
+    paper_status,
+    read_jsonl,
+    render_trade_webhook,
+    simulate_fill,
+    resolution_exit_price,
+    apply_resolution,
+    run_resolution_cycle,
+    check_positions_for_resolution,
+    render_resolution_webhook,
+)
+from polymarket_bot.gamma import resolved_outcome_for_token, markets_by_token
 
 
 class CoreTests(unittest.TestCase):
@@ -242,7 +255,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("stale_fill", rows[1]["reject_reason"])
             self.assertEqual(set(rows[1]["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
             status = paper_status(cfg)
-            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "accepts_by_latency", "rejects_today", "rejects_by_reason", "realized_pnl", "unrealized_pnl", "open_notional", "account_value", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet"})
+            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "accepts_by_latency", "rejects_today", "rejects_by_reason", "realized_pnl", "realized_pnl_today", "unrealized_pnl", "open_notional", "account_value", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet"})
             self.assertGreaterEqual(status["rejects_today"], 1)
     def test_paper_follower_entry_and_exit_rows_include_book_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
@@ -344,6 +357,131 @@ class CoreTests(unittest.TestCase):
             r3 = daemon.process_fill(buy3, 2)
             self.assertEqual(r3[1]["type"], "reject")
             self.assertIn("daily_entry_cap", r3[1]["reject_reason"])
+
+    def test_resolution_exit_price_mapping(self):
+        # YES/NO mapping
+        self.assertEqual(resolution_exit_price("YES", "YES"), 1.0)
+        self.assertEqual(resolution_exit_price("YES", "NO"), 0.0)
+        self.assertEqual(resolution_exit_price("YES", "1"), 1.0)
+        self.assertEqual(resolution_exit_price("NO", "NO"), 1.0)
+        self.assertEqual(resolution_exit_price("NO", "YES"), 0.0)
+        self.assertEqual(resolution_exit_price("YES", "MAYBE"), None)
+        self.assertEqual(resolution_exit_price(None, "YES"), None)
+        self.assertEqual(resolution_exit_price("YES", None), None)
+
+    def test_apply_resolution_writes_correct_pnl(self):
+        state = {
+            "positions": {
+                "0xw:tok1": {
+                    "wallet": "0xw",
+                    "token": "tok1",
+                    "entry_price": 0.50,
+                    "shares": 200.0,
+                    "cost_usd": 100.0,
+                }
+            }
+        }
+        action = {"action": "resolve", "pos_id": "0xw:tok1", "exit_price": 1.0, "side": "YES", "question": "Will it rain?", "market_id": "m1"}
+        row = apply_resolution(state, action)
+        self.assertEqual(row["type"], "resolution")
+        self.assertEqual(row["sim_fill_price"], 1.0)
+        # pnl = (1.0 * 200) - 100 = 100
+        self.assertAlmostEqual(row["pnl"], 100.0, places=4)
+        # Position popped
+        self.assertNotIn("0xw:tok1", state["positions"])
+
+        # Loss case
+        state["positions"]["0xw:tok2"] = {"wallet": "0xw", "token": "tok2", "entry_price": 0.40, "shares": 250.0, "cost_usd": 100.0}
+        row2 = apply_resolution(state, {"action": "resolve", "pos_id": "0xw:tok2", "exit_price": 0.0, "side": "YES", "question": "Will it rain?", "market_id": "m1"})
+        # pnl = (0.0 * 250) - 100 = -100
+        self.assertAlmostEqual(row2["pnl"], -100.0, places=4)
+
+    def test_check_positions_resolution_skips_unresolved(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paper = root / "paper"
+            paper.mkdir()
+            cfg = PaperConfig(paper_dir=paper, ledger_path=paper / "ledger.jsonl", state_path=paper / "state.json", allowlist_path=paper / "allowlist.json", data_quality_path=paper / "data_quality.json")
+            cfg.allowlist_path.write_text(json.dumps({"wallets": ["0xw"]}))
+            archive_cfg = ArchiveConfig(archive_dir=root / "archive", state_path=root / "state.json", followup_queue_path=root / "followups.json")
+            daemon = PaperFollowerDaemon(cfg, archive_cfg)
+            # Inject a synthetic open position
+            daemon.state["positions"]["0xw:tok_unres"] = {"wallet": "0xw", "token": "tok_unres", "entry_price": 0.50, "shares": 200.0, "cost_usd": 100.0}
+            daemon.state["positions"]["0xw:tok_unknown"] = {"wallet": "0xw", "token": "tok_unknown", "entry_price": 0.50, "shares": 200.0, "cost_usd": 100.0}
+            with patch("polymarket_bot.paper_follower.resolved_outcome_for_token") as mock:
+                from unittest.mock import MagicMock
+                mock.side_effect = [
+                    {"resolved": False, "resolution_status": None, "side": "YES", "question": "Q", "market_id": "m1", "closed": False, "active": True},
+                    None,  # gamma unknown
+                ]
+                actions = check_positions_for_resolution(daemon.state)
+            skip_reasons = [a.get("reason") for a in actions if a["action"] == "skip"]
+            self.assertIn("not_resolved", skip_reasons)
+            self.assertIn("gamma_unknown", skip_reasons)
+            # No resolve actions emitted
+            self.assertFalse(any(a["action"] == "resolve" for a in actions))
+
+    def test_run_resolution_cycle_emits_exits_and_persists(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paper = root / "paper"
+            paper.mkdir()
+            cfg = PaperConfig(paper_dir=paper, ledger_path=paper / "ledger.jsonl", state_path=paper / "state.json", allowlist_path=paper / "allowlist.json", data_quality_path=paper / "data_quality.json")
+            cfg.allowlist_path.write_text(json.dumps({"wallets": ["0xw"]}))
+            archive_cfg = ArchiveConfig(archive_dir=root / "archive", state_path=root / "state.json", followup_queue_path=root / "followups.json")
+            daemon = PaperFollowerDaemon(cfg, archive_cfg)
+            # Inject two open positions — one resolves YES, one stays unresolved
+            daemon.state["positions"]["0xw:winner"] = {"wallet": "0xw", "token": "winner_token", "entry_price": 0.50, "shares": 200.0, "cost_usd": 100.0}
+            daemon.state["positions"]["0xw:loser_unres"] = {"wallet": "0xw", "token": "loser_token", "entry_price": 0.50, "shares": 200.0, "cost_usd": 100.0}
+            with patch("polymarket_bot.paper_follower.resolved_outcome_for_token") as mock:
+                mock.side_effect = [
+                    {"resolved": True, "resolution_status": "YES", "side": "YES", "question": "Q?", "market_id": "m1", "closed": True},
+                    {"resolved": False, "resolution_status": None, "side": "YES", "question": "Q?", "market_id": "m2", "closed": False},
+                ]
+                # Pass config explicitly to bypass monkeypatch on import
+                summary = run_resolution_cycle(daemon.state, cfg, config=None)
+            self.assertEqual(summary["checked"], 2)
+            self.assertEqual(summary["resolved"], 1)
+            self.assertEqual(summary["skipped"], 1)
+            # winner popped
+            self.assertNotIn("0xw:winner", daemon.state["positions"])
+            # loser still there
+            self.assertIn("0xw:loser_unres", daemon.state["positions"])
+            # Ledger has a resolution row
+            ledger_rows = read_jsonl(cfg.ledger_path)
+            res_rows = [r for r in ledger_rows if r.get("type") == "resolution"]
+            self.assertEqual(len(res_rows), 1)
+            self.assertEqual(res_rows[0]["position_id"], "0xw:winner")
+            self.assertAlmostEqual(res_rows[0]["pnl"], 100.0, places=4)
+            # Status reflects realized PnL
+            status = paper_status(cfg)
+            self.assertAlmostEqual(status["realized_pnl"], 100.0, places=4)
+            self.assertAlmostEqual(status["realized_pnl_today"], 100.0, places=4)
+
+    def test_process_resolution_once_throttles_and_force(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            paper = root / "paper"
+            paper.mkdir()
+            cfg = PaperConfig(paper_dir=paper, ledger_path=paper / "ledger.jsonl", state_path=paper / "state.json", allowlist_path=paper / "allowlist.json", data_quality_path=paper / "data_quality.json", resolution_poll_seconds=999999)
+            cfg.allowlist_path.write_text(json.dumps({"wallets": ["0xw"]}))
+            acfg = ArchiveConfig(archive_dir=root / "archive", state_path=root / "state.json", followup_queue_path=root / "followups.json")
+            daemon = PaperFollowerDaemon(cfg, acfg)
+            with patch("polymarket_bot.paper_follower.run_resolution_cycle") as m:
+                m.return_value = {"checked": 0, "resolved": 0, "skipped": 0, "last_checked_at": "x"}
+                self.assertIsNone(daemon.process_resolution_once())
+                # Force bypasses throttle
+                summary = daemon.process_resolution_once(force=True)
+                self.assertEqual(summary["checked"], 0)
+                self.assertGreaterEqual(m.call_count, 1)
+
+    def test_render_resolution_webhook_label(self):
+        # Resolution row renders as "MARKET RESOLVED"
+        row = {"type": "resolution", "wallet": "0xw", "market": "Q?", "token": "tok123", "side": "BUY", "sim_fill_price": 1.0, "pnl": 50.0}
+        status = {"account_value": 1000, "open_notional": 100, "realized_pnl": 50}
+        msg = render_trade_webhook(row, status) or render_resolution_webhook(row, status)
+        self.assertIn("MARKET RESOLVED", msg)
+        self.assertIn("`0xw`", msg)
 
 
 if __name__ == "__main__":
