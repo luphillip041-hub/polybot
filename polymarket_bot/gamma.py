@@ -90,26 +90,107 @@ def markets_by_token(token_id: str, config: BotConfig = CONFIG) -> list[dict[str
     return data if isinstance(data, list) else []
 
 
+def clob_condition_id_for_token(token_id: str, config: BotConfig = CONFIG) -> str | None:
+    """Resolve a CLOB token id to its parent condition id via the CLOB service.
+
+    The Gamma `markets?clob_token_ids=` filter returns an empty list for many tokens
+    (including the ones in our open book), even though the market exists. To work
+    around this we round-trip through the CLOB service, which exposes the
+    condition↔token mapping directly.
+    """
+    if not token_id:
+        return None
+    try:
+        from .http import get_json
+        data = get_json(config.clob_base, f"/markets-by-token/{token_id}", user_agent=config.user_agent)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        cid = data.get("condition_id")
+        return str(cid) if cid else None
+    return None
+
+
+def event_by_clob_token(token_id: str, config: BotConfig = CONFIG) -> list[dict[str, Any]]:
+    """Fetch events containing this token (the truest path — bypasses CLOB/Gamma cid mismatch)."""
+    if not token_id:
+        return []
+    try:
+        data = get_json(config.gamma_base, "/events", {"clob_token_ids": token_id}, user_agent=config.user_agent)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def event_by_condition(condition_id: str, config: BotConfig = CONFIG) -> list[dict[str, Any]]:
+    """Legacy lookup kept for compatibility — sometimes returns wildcards.
+
+    Returns the raw events list — caller must scan markets for `conditionId` match.
+    """
+    if not condition_id:
+        return []
+    try:
+        data = get_json(config.gamma_base, "/events", {"condition_id": condition_id}, user_agent=config.user_agent)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
 def resolved_outcome_for_token(token_id: str, config: BotConfig = CONFIG) -> dict[str, Any] | None:
     """Look up resolution status for the market that contains this token.
 
     Returns a dict like:
       {"resolved": True/False, "side": "YES"|"NO"|None, "question": ..., "market_id": ..., "closed": bool}
 
-    Returns None if lookup failed or token is unknown to Gamma.
-    Side is the outcome *our* token represents (YES or NO) so caller can price a long correctly.
+    Returns None if lookup failed or token is unknown.
+
+    Lookup order:
+      1. Gamma /events?clob_token_ids={token} → returns the parent event(s). Walk
+         event.markets[] for the market that owns our token (by clobTokenIds[]).
+         This is the most reliable path — CLOB `condition_id` and Gamma
+         `conditionId` aren't always the same identifier.
+      2. Fallback to /markets?clob_token_ids={token} for the rare cases where
+         events lookup returns nothing.
     """
-    markets = markets_by_token(token_id, config=config)
-    if not markets:
+    if not token_id:
         return None
-    market = markets[0] if isinstance(markets[0], dict) else {}
+
+    # Path 1: /events?clob_token_ids=
+    events = event_by_clob_token(token_id, config=config)
+    market: dict[str, Any] | None = None
+    event_dict: dict[str, Any] | None = None
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        for m in (evt.get("markets") or []):
+            if not isinstance(m, dict):
+                continue
+            ids = _parse_array(m.get("clobTokenIds"))
+            if any(str(x).lower() == token_id.lower() for x in ids):
+                market = m
+                event_dict = evt
+                break
+        if market is not None:
+            break
+
+    # Path 2: /markets?clob_token_ids= fallback
+    if market is None:
+        rows = markets_by_token(token_id, config=config)
+        for row in rows:
+            if isinstance(row, dict):
+                market = row
+                break
+
+    if market is None:
+        return None
+
     closed = bool(market.get("closed"))
     resolution_status = market.get("umaResolutionStatus") or market.get("resolution")
     clob_ids = _parse_array(market.get("clobTokenIds"))
     token_lower = token_id.lower()
     side: str | None = None
-    for idx, cid in enumerate(clob_ids):
-        if str(cid).lower() == token_lower:
+    for idx, cid_val in enumerate(clob_ids):
+        if str(cid_val).lower() == token_lower:
             outcomes = _parse_array(market.get("outcomes"))
             if idx < len(outcomes):
                 outcome_label = str(outcomes[idx]).strip().upper()
@@ -123,10 +204,11 @@ def resolved_outcome_for_token(token_id: str, config: BotConfig = CONFIG) -> dic
         "resolved": bool(closed and resolution_status),
         "resolution_status": resolution_status,
         "side": side,
-        "question": market.get("question"),
-        "market_id": market.get("id"),
-        "condition_id": market.get("conditionId") or market.get("condition_id"),
+        "question": (market.get("question") if isinstance(market, dict) else None)
+            or (event_dict.get("title") if isinstance(event_dict, dict) else None),
+        "market_id": market.get("id") if isinstance(market, dict) else None,
+        "condition_id": str(market.get("conditionId") or market.get("condition_id") or ""),
         "closed": closed,
-        "active": market.get("active"),
+        "active": market.get("active") if isinstance(market, dict) else None,
         "raw": market,
     }

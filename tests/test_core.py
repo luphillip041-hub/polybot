@@ -359,7 +359,12 @@ class CoreTests(unittest.TestCase):
             self.assertIn("daily_entry_cap", r3[1]["reject_reason"])
 
     def test_resolution_exit_price_mapping(self):
-        # YES/NO mapping
+        # PRIMARY/SECONDARY (on-chain) — long-PRIMARY wins when status==PRIMARY
+        self.assertEqual(resolution_exit_price("PRIMARY", "PRIMARY"), 1.0)
+        self.assertEqual(resolution_exit_price("PRIMARY", "SECONDARY"), 0.0)
+        self.assertEqual(resolution_exit_price("SECONDARY", "SECONDARY"), 1.0)
+        self.assertEqual(resolution_exit_price("SECONDARY", "PRIMARY"), 0.0)
+        # YES/NO (legacy Gamma) still works
         self.assertEqual(resolution_exit_price("YES", "YES"), 1.0)
         self.assertEqual(resolution_exit_price("YES", "NO"), 0.0)
         self.assertEqual(resolution_exit_price("YES", "1"), 1.0)
@@ -408,16 +413,16 @@ class CoreTests(unittest.TestCase):
             # Inject a synthetic open position
             daemon.state["positions"]["0xw:tok_unres"] = {"wallet": "0xw", "token": "tok_unres", "entry_price": 0.50, "shares": 200.0, "cost_usd": 100.0}
             daemon.state["positions"]["0xw:tok_unknown"] = {"wallet": "0xw", "token": "tok_unknown", "entry_price": 0.50, "shares": 200.0, "cost_usd": 100.0}
-            with patch("polymarket_bot.paper_follower.resolved_outcome_for_token") as mock:
+            with patch("polymarket_bot.paper_follower._onchain_resolved_outcome_for_token") as mock:
                 from unittest.mock import MagicMock
                 mock.side_effect = [
-                    {"resolved": False, "resolution_status": None, "side": "YES", "question": "Q", "market_id": "m1", "closed": False, "active": True},
+                    {"resolved": False, "resolution_status": None, "side": "PRIMARY", "question": "Q", "market_id": "m1", "closed": False, "active": True},
                     None,  # gamma unknown
                 ]
                 actions = check_positions_for_resolution(daemon.state)
             skip_reasons = [a.get("reason") for a in actions if a["action"] == "skip"]
             self.assertIn("not_resolved", skip_reasons)
-            self.assertIn("gamma_unknown", skip_reasons)
+            self.assertIn("no_condition_id", skip_reasons)
             # No resolve actions emitted
             self.assertFalse(any(a["action"] == "resolve" for a in actions))
 
@@ -433,10 +438,10 @@ class CoreTests(unittest.TestCase):
             # Inject two open positions — one resolves YES, one stays unresolved
             daemon.state["positions"]["0xw:winner"] = {"wallet": "0xw", "token": "winner_token", "entry_price": 0.50, "shares": 200.0, "cost_usd": 100.0}
             daemon.state["positions"]["0xw:loser_unres"] = {"wallet": "0xw", "token": "loser_token", "entry_price": 0.50, "shares": 200.0, "cost_usd": 100.0}
-            with patch("polymarket_bot.paper_follower.resolved_outcome_for_token") as mock:
+            with patch("polymarket_bot.paper_follower._onchain_resolved_outcome_for_token") as mock:
                 mock.side_effect = [
-                    {"resolved": True, "resolution_status": "YES", "side": "YES", "question": "Q?", "market_id": "m1", "closed": True},
-                    {"resolved": False, "resolution_status": None, "side": "YES", "question": "Q?", "market_id": "m2", "closed": False},
+                    {"resolved": True, "resolution_status": "PRIMARY", "side": "PRIMARY", "question": "Q?", "market_id": "m1", "closed": True},
+                    {"resolved": False, "resolution_status": None, "side": "PRIMARY", "question": "Q?", "market_id": "m2", "closed": False},
                 ]
                 # Pass config explicitly to bypass monkeypatch on import
                 summary = run_resolution_cycle(daemon.state, cfg, config=None)
@@ -482,6 +487,51 @@ class CoreTests(unittest.TestCase):
         msg = render_trade_webhook(row, status) or render_resolution_webhook(row, status)
         self.assertIn("MARKET RESOLVED", msg)
         self.assertIn("`0xw`", msg)
+
+    def test_resolution_calldata_encoders(self):
+        from eth_abi.abi import decode
+        from polymarket_bot.resolution import (
+            encode_payout_denominator_call,
+            encode_payout_numerators_call,
+            encode_try_aggregate,
+            decode_try_aggregate_result,
+            CTF_ADDRESS,
+            SEL_PAYOUT_DENOM,
+            SEL_PAYOUT_NUMS,
+        )
+        cond_id = "0x31336effb831028d68e8ba3ef775a83ef77600fa932052b865996838e3cbc226"
+        cd = encode_payout_denominator_call(cond_id)
+        # First 4 bytes should be the selector; the rest is ABI-encoded bytes32
+        self.assertEqual(cd[:4].hex(), SEL_PAYOUT_DENOM)
+        arg = cd[4:]
+        [decoded] = decode(["bytes32"], arg)
+        self.assertEqual(bytes.fromhex(cond_id[2:]), decoded)
+
+        # payoutNumerators(bytes32, uint256)
+        cd2 = encode_payout_numerators_call(cond_id, 1)
+        self.assertEqual(cd2[:4].hex(), SEL_PAYOUT_NUMS)
+        [cbn, idx] = decode(["bytes32", "uint256"], cd2[4:])
+        self.assertEqual(bytes.fromhex(cond_id[2:]), cbn)
+        self.assertEqual(idx, 1)
+
+        # Multicall3 encoding round-trip
+        ctf_bytes = bytes.fromhex(CTF_ADDRESS[2:].lower())
+        calls = [
+            (ctf_bytes, encode_payout_denominator_call(cond_id)),
+            (ctf_bytes, encode_payout_numerators_call(cond_id, 1)),
+        ]
+        agg_cd = encode_try_aggregate(calls)
+        self.assertTrue(agg_cd.startswith(bytes.fromhex("bce38bd7")))
+
+    def test_clob_condition_id_lookup_real(self):
+        """Real CLOB round-trip — confirms we can map token → condition_id via the CLOB service."""
+        from polymarket_bot.resolution import map_token_to_condition
+        # Known token from our open position book — should resolve to a real condition_id via CLOB
+        token = "114904041730147599562228540677844419716758281936953961039142785465496240966083"
+        info = map_token_to_condition(token)
+        self.assertIsNotNone(info)
+        self.assertTrue(info["condition_id"].startswith("0x"))
+        self.assertEqual(info["primary_token_id"].lower(), token.lower())
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from typing import Any
 from .archive_config import ArchiveConfig
 from .book_archive import trade_id
 from .config import BotConfig
-from .gamma import resolved_outcome_for_token
+from .resolution import TokenMap, resolved_outcome_for_token as _onchain_resolved_outcome_for_token, RpcClient
 
 LOG = logging.getLogger("polymarket_paper_follower")
 
@@ -581,23 +581,36 @@ def render_resolution_webhook(row: dict[str, Any], status: dict[str, Any]) -> st
 
 
 def resolution_exit_price(side: str | None, outcome_status: str | object) -> float | None:
-    """Translate a Gamma resolution status + token-side into an exit price.
+    """Translate (side, status) into an exit price for a long-only paper holder.
 
-    YES token (we hold) settles at 1.00 if YES won, 0.00 if NO won.
-    NO token (we hold) settles at 1.00 if NO won, 0.00 if YES won.
+    Sources of (side, status):
+      - Gamma paths: side="YES"|"NO"|<other>, status="YES"|"NO"|...
+      - On-chain path: side="PRIMARY"|"SECONDARY", status="PRIMARY"|"SECONDARY"
 
-    Returns None if we can't infer the side (multi-outcome / unknown).
-    """
+    Rules:
+      - For both mapping styles, the principle is: did the index our token
+        represents win? If yes -> exit at 1.0 (pays out $1 per share), else 0.0.
+      - We hold PRIMARY by construction (paper follower is long-only and the
+        CLOB returns tokens ordered as [primary, secondary] where primary is
+        the YES-equivalent).
+20    """
     status_upper = str(outcome_status or "").strip().upper()
     if status_upper in {"", "UNKNOWN", "NONE"}:
         return None
     side_upper = str(side or "").strip().upper()
+
+    # PRIMARY/SECONDARY (on-chain) — our PRIMARY long wins when status=="PRIMARY"
+    if side_upper == "PRIMARY":
+        return 1.0 if status_upper == "PRIMARY" else 0.0
+    if side_upper == "SECONDARY":
+        return 1.0 if status_upper == "SECONDARY" else 0.0
+
+    # YES/NO (legacy Gamma)
     if side_upper == "YES":
         if status_upper in {"YES", "TRUE", "1", "1.0"}:
             return 1.0
         if status_upper in {"NO", "FALSE", "0", "0.0"}:
             return 0.0
-        # Some markets use outcomes array positions; treat non-matching labels as unknown
         return None
     if side_upper == "NO":
         if status_upper in {"NO", "FALSE", "0", "0.0"}:
@@ -607,17 +620,26 @@ def resolution_exit_price(side: str | None, outcome_status: str | object) -> flo
     return None
 
 
-def check_positions_for_resolution(state: dict[str, Any], config: BotConfig | None = None) -> list[dict[str, Any]]:
-    """For each open position, attempt resolution lookup. Returns actions to take.
+def check_positions_for_resolution(
+    state: dict[str, Any],
+    config: BotConfig | None = None,
+    token_map: TokenMap | None = None,
+    rpc: RpcClient | None = None,
+) -> list[dict[str, Any]]:
+    """For each open position, attempt resolution lookup via on-chain settlement.
 
     Each action is one of:
-      {"action": "resolve", "pos_id": ..., "exit_price": 1.0|0.0, "question": ..., "side": ...}
-      {"action": "skip",    "pos_id": ..., "reason": "not_resolved"}
+      {"action": "resolve", "pos_id": ..., "exit_price": 1.0|0.0, "side": "PRIMARY"|"SECONDARY"|...}
+      {"action": "skip",    "pos_id": ..., "reason": "not_resolved"|"no_condition_id"|...}
     """
     from .config import CONFIG as _default_cfg
     effective_cfg: BotConfig = config if isinstance(config, BotConfig) else _default_cfg  # type: ignore[assignment]
+    # paper_dir for TokenMap — fall back to default cfg's runs/paper
+    paper_dir = Path(getattr(effective_cfg, 'paper_dir', None) or (_default_cfg.runs_dir / "paper"))
+    token_map = token_map or TokenMap.load(paper_dir)
     positions = state.get("positions", {}) if isinstance(state.get("positions"), dict) else {}
     actions: list[dict[str, Any]] = []
+    rpc = rpc or RpcClient()
     for pos_id, pos in positions.items():
         if not isinstance(pos, dict):
             continue
@@ -625,9 +647,13 @@ def check_positions_for_resolution(state: dict[str, Any], config: BotConfig | No
         if not token:
             actions.append({"action": "skip", "pos_id": pos_id, "reason": "no_token"})
             continue
-        info = resolved_outcome_for_token(token, config=effective_cfg)
+        try:
+            info = _onchain_resolved_outcome_for_token(token, token_map=token_map, rpc=rpc, config=effective_cfg)
+        except Exception:
+            actions.append({"action": "skip", "pos_id": pos_id, "reason": "rpc_error"})
+            continue
         if info is None:
-            actions.append({"action": "skip", "pos_id": pos_id, "reason": "gamma_unknown"})
+            actions.append({"action": "skip", "pos_id": pos_id, "reason": "no_condition_id"})
             continue
         if not info.get("resolved"):
             actions.append({"action": "skip", "pos_id": pos_id, "reason": "not_resolved"})
