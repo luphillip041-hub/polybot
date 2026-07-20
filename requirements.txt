@@ -1,0 +1,17 @@
+# Core
+requests>=2.32.0
+python-dotenv>=1.0.0
+websockets>=12.0
+
+# CLOB client
+py-clob-client>=0.20.0
+
+# Discord (for discord_monitor.py)
+discord.py>=2.3.0
+
+# Testing
+pytest>=8.0
+pytest-mock>=3.0
+
+# Optional: dashboard / status API
+flask>=3.0

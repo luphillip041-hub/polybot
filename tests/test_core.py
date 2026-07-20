@@ -536,3 +536,103 @@ class CoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfigTests(unittest.TestCase):
+    """Tests for env-based config helpers (from the reviewed zip's approach)."""
+
+    def test_env_int(self):
+        """env_int reads integers from environment."""
+        from polymarket_bot.config import env_int
+        with patch.dict("os.environ", {"TEST_INT": "42"}):
+            self.assertEqual(env_int("TEST_INT", 0), 42)
+
+    def test_env_int_fallback(self):
+        """env_int falls back to default for missing keys."""
+        from polymarket_bot.config import env_int
+        self.assertEqual(env_int("MISSING_VAR_XYZ", 150), 150)
+
+    def test_env_str(self):
+        """env_str reads strings from environment."""
+        from polymarket_bot.config import env_str
+        with patch.dict("os.environ", {"TEST_STR": "hello"}):
+            self.assertEqual(env_str("TEST_STR", "fallback"), "hello")
+
+    def test_env_str_fallback(self):
+        """env_str falls back to default for missing keys."""
+        from polymarket_bot.config import env_str
+        self.assertEqual(env_str("MISSING_VAR_XYZ", "default_val"), "default_val")
+
+    def test_env_float(self):
+        """env_float reads floats from environment."""
+        from polymarket_bot.config import env_float
+        with patch.dict("os.environ", {"TEST_FLOAT": "3.14"}):
+            self.assertEqual(env_float("TEST_FLOAT", 0.0), 3.14)
+
+    def test_archive_config_load_from_file(self):
+        """ArchiveConfig.load reads from a real JSON file."""
+        import tempfile, json
+        from polymarket_bot.archive_config import ArchiveConfig
+        cfg_data = {"top_n_markets": 5, "max_tokens": 100}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(cfg_data, f)
+            cfg_path = f.name
+        try:
+            cfg = ArchiveConfig.load(cfg_path)
+            self.assertEqual(cfg.top_n_markets, 5)
+            self.assertEqual(cfg.max_tokens, 100)
+        finally:
+            import os as _os
+            _os.unlink(cfg_path)
+
+
+class AlertsTests(unittest.TestCase):
+    """Tests for Telegram alerts module."""
+
+    def test_send_telegram_noop_when_not_configured(self):
+        """send_telegram silently returns True when Telegram not configured."""
+        from polymarket_bot.alerts import send_telegram
+        with patch.dict("os.environ", {}, clear=True):
+            result = send_telegram("test message")
+            self.assertTrue(result)
+
+    def test_send_telegram_noop_on_empty_token(self):
+        """send_telegram returns True when only chat_id is missing."""
+        from polymarket_bot.alerts import send_telegram
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "test", "TELEGRAM_CHAT_ID": ""}):
+            result = send_telegram("test")
+            self.assertTrue(result)
+
+    def test_send_telegram_http_call_mocked(self):
+        """send_telegram makes HTTP POST to Telegram API."""
+        from unittest.mock import patch as mock_patch
+        from polymarket_bot.alerts import send_telegram
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "456"}):
+            with mock_patch("requests.post") as mock_post:
+                mock_post.return_value.status_code = 200
+                result = send_telegram("hello")
+                self.assertTrue(result)
+                mock_post.assert_called_once()
+                url = mock_post.call_args[0][0]
+                self.assertIn("123:abc", url)
+
+
+class PreflightTests(unittest.TestCase):
+    """Tests for preflight script."""
+
+    def test_check_python_version_passes(self):
+        """check_python_version returns True on current Python."""
+        from scripts.preflight import check_python_version
+        import sys
+        expected = sys.version_info[:2]
+        with patch.object(sys, "version_info", sys.version_info):
+            result = check_python_version()
+            self.assertTrue(result)
+
+    def test_check_config_root_exists(self):
+        """check_config passes when root/runs exist."""
+        from scripts.preflight import check_config
+        with patch("pathlib.Path.exists", return_value=True):
+            result = check_config()
+            self.assertTrue(result)
+

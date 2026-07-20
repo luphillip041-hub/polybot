@@ -15,6 +15,7 @@ from typing import Any
 from .archive_config import ArchiveConfig
 from .book_archive import trade_id
 from .config import BotConfig
+from .alerts import send_telegram
 from .resolution import TokenMap, resolved_outcome_for_token as _onchain_resolved_outcome_for_token, RpcClient
 
 LOG = logging.getLogger("polymarket_paper_follower")
@@ -462,12 +463,14 @@ class PaperFollowerDaemon:
                 wrote += 1
         save_state(self.cfg.state_path, self.state)
         webhook_url = os.getenv("POLYMARKET_PAPER_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK_URL")
-        if webhook_url and notify_rows:
+        if notify_rows:
             status = paper_status(self.cfg)
             for row in notify_rows:
                 message = render_trade_webhook(row, status)
                 if message:
-                    post_discord_webhook(webhook_url, message)
+                    if webhook_url:
+                        post_discord_webhook(webhook_url, message)
+                    send_telegram(message)
         return wrote
 
     def process_resolution_once(self, *, force: bool = False) -> dict[str, Any] | None:
@@ -739,12 +742,14 @@ def run_resolution_cycle(state: dict[str, Any], cfg: PaperConfig, config: BotCon
         else:
             summary["skipped"] += 1
     save_state(cfg.state_path, state)
-    if webhook_url and summary["exit_rows"]:
+    if summary["exit_rows"]:
         status = paper_status(cfg)
         for row in summary["exit_rows"]:
             message = render_trade_webhook(row, status)
             if message:
-                post_discord_webhook(webhook_url, message)
+                if webhook_url:
+                    post_discord_webhook(webhook_url, message)
+                send_telegram(message)
     summary["last_checked_at"] = iso_now()
     return summary
 
