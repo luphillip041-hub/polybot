@@ -25,8 +25,6 @@ def active_events(limit: int = 50, config: BotConfig = CONFIG) -> list[dict[str,
     data = get_json(config.gamma_base, "/events", {
         "active": "true",
         "closed": "false",
-        "order": "volume_24hr",
-        "ascending": "false",
         "limit": limit,
     }, user_agent=config.user_agent)
     return data if isinstance(data, list) else data.get("events", [])

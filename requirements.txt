@@ -15,3 +15,11 @@ pytest-mock>=3.0
 
 # Optional: dashboard / status API
 flask>=3.0
+
+# Status API (live uses fastapi, not flask)
+fastapi>=0.110
+uvicorn>=0.27
+
+# On-chain resolution (resolution.py)
+eth-abi>=4.2
+eth-utils>=4.1
