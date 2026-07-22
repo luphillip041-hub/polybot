@@ -342,6 +342,12 @@ def reject_reasons(row: dict[str, Any], cfg: PaperConfig, archive_cfg: ArchiveCo
     side = side_norm(row.get("fill_side") or (row.get("trade") or {}).get("side"))
     if side not in {"BUY", "SELL"}:
         reasons.append("unknown_side")
+    # Lottery-ticket filter: skip BUYs where the wallet filled below 10¢.
+    # On the 5d sample these two trades alone were 84% of total PnL — pure variance,
+    # not edge. SELLs are unaffected so we still close any 5¢ positions we may already hold.
+    fill_price = row.get("fill_price")
+    if side == "BUY" and fill_price is not None and num(fill_price) < 0.10:
+        reasons.append("lottery_price_band")
     if top3_notional(book, side if side in {"BUY", "SELL"} else "BUY") < cfg.stake_usd * cfg.min_top3_liquidity_multiple:
         reasons.append("illiquid_depth")
     if market_resolution_soon(book, detect_ts):
