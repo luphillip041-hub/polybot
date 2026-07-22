@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -119,10 +119,9 @@ def configured_wallets() -> list[dict[str, str]]:
     return wallets
 
 
-def iter_gzip_jsonl(path: Path, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
-    rows: list[dict[str, Any]] = []
+def iter_gzip_jsonl(path: Path, offset: int = 0) -> Iterator[dict[str, Any]]:
     if not path.exists():
-        return rows, offset
+        return
     size = path.stat().st_size
     if offset > size:
         offset = 0
@@ -138,8 +137,8 @@ def iter_gzip_jsonl(path: Path, offset: int = 0) -> tuple[list[dict[str, Any]], 
                     except Exception:
                         continue
                     if isinstance(row, dict):
-                        rows.append(row)
-        return rows, size
+                        yield row
+        return
     except Exception:
         # A crash can leave a partial final gzip member. Re-read from zero and keep
         # all valid prior members; gzip will still expose complete earlier members.
@@ -151,10 +150,9 @@ def iter_gzip_jsonl(path: Path, offset: int = 0) -> tuple[list[dict[str, Any]], 
                     except Exception:
                         continue
                     if isinstance(row, dict):
-                        rows.append(row)
-            return rows, size
+                        yield row
         except Exception:
-            return [], offset
+            return
 
 
 def jsonl_paths(prefix: str, start: datetime, end: datetime) -> list[Path]:
@@ -169,7 +167,15 @@ def jsonl_paths(prefix: str, start: datetime, end: datetime) -> list[Path]:
 class RollingState:
     last_refresh: float = 0.0
     offsets: dict[str, int] = field(default_factory=dict)
-    book_rows: list[dict[str, Any]] = field(default_factory=list)
+    # Don't store full book rows — they accumulate to millions and OOM the service.
+    # Track only what /api/status and /api/gaps actually surface.
+    gap_rows: list[dict[str, Any]] = field(default_factory=list)  # sparse, all gap rows in 14d
+    book_count_hour: int = 0  # count of book rows in current hour
+    current_hour_start: datetime = field(
+        default_factory=lambda: utc_now().replace(minute=0, second=0, microsecond=0)
+    )
+    last_ws_ts: datetime | None = None
+    # Shadow rows are smaller; cap to 7d (used for fills_today, wallets 7d, tokens_7d)
     shadow_rows: list[dict[str, Any]] = field(default_factory=list)
     heartbeat: dict[str, Any] = field(default_factory=dict)
 
@@ -181,34 +187,56 @@ class RollingState:
         hb = read_json(ARCHIVE_DIR / "heartbeat_latest.json")
         if isinstance(hb, dict):
             self.heartbeat = hb
+        # Reset hour counter when hour rolls over
+        new_hour = utc_now().replace(minute=0, second=0, microsecond=0)
+        if new_hour != self.current_hour_start:
+            self.current_hour_start = new_hour
+            self.book_count_hour = 0
         # Keep enough rolling context for today + 7d wallets + max 14d gaps.
         start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=14)
         end = utc_now() + timedelta(days=1)
         for path in jsonl_paths("book", start, end):
-            rows, new_offset = iter_gzip_jsonl(path, self.offsets.get(str(path), 0))
-            if rows:
-                self.book_rows.extend(rows)
-            self.offsets[str(path)] = new_offset
+            old_offset = self.offsets.get(str(path), 0)
+            for row in iter_gzip_jsonl(path, old_offset):
+                rtype = row.get("type")
+                if rtype == "book":
+                    ts = parse_ts(row.get("ts"))
+                    if row.get("source") == "websocket" and ts and (
+                        self.last_ws_ts is None or ts > self.last_ws_ts
+                    ):
+                        self.last_ws_ts = ts
+                    if ts and ts >= self.current_hour_start:
+                        self.book_count_hour += 1
+                elif rtype == "gap":
+                    self.gap_rows.append(row)
+            if path.exists():
+                self.offsets[str(path)] = path.stat().st_size
         for path in jsonl_paths("shadow", start, end):
-            rows, new_offset = iter_gzip_jsonl(path, self.offsets.get(str(path), 0))
-            if rows:
-                self.shadow_rows.extend(rows)
-            self.offsets[str(path)] = new_offset
-        cutoff = utc_now() - timedelta(days=14)
-        self.book_rows = [r for r in self.book_rows if (parse_ts(r.get("ts") or r.get("end_ts")) or utc_now()) >= cutoff]
-        self.shadow_rows = [r for r in self.shadow_rows if (parse_ts(r.get("ts") or r.get("fill_timestamp")) or utc_now()) >= cutoff]
+            for row in iter_gzip_jsonl(path, self.offsets.get(str(path), 0)):
+                self.shadow_rows.append(row)
+            if path.exists():
+                self.offsets[str(path)] = path.stat().st_size
+        cutoff_14d = utc_now() - timedelta(days=14)
+        cutoff_7d = utc_now() - timedelta(days=7)
+        self.gap_rows = [
+            r for r in self.gap_rows
+            if (parse_ts(r.get("end_ts") or r.get("ts")) or utc_now()) >= cutoff_14d
+        ]
+        self.shadow_rows = [
+            r for r in self.shadow_rows
+            if (parse_ts(r.get("ts") or r.get("fill_timestamp")) or utc_now()) >= cutoff_7d
+        ]
 
     def status(self) -> dict[str, Any]:
         self.refresh()
         now = utc_now()
         today_start, today_end = day_bounds(0)
-        hour_start = now.replace(minute=0, second=0, microsecond=0)
         hb_stats = self.heartbeat.get("stats") if isinstance(self.heartbeat.get("stats"), dict) else {}
         disk = self.heartbeat.get("disk_estimate") if isinstance(self.heartbeat.get("disk_estimate"), dict) else {}
         today_gaps = self._gaps_between(today_start, now)
         gap_seconds = sum(g["duration_s"] for g in today_gaps)
         elapsed_today = max(1.0, (now - today_start).total_seconds())
-        last_ws = self._last_ws_ts()
+        last_ws = self.last_ws_ts
         last_ws_age = (now - last_ws).total_seconds() if last_ws else 999999999.0
         fills_today = self._shadow_rows("fill", today_start, today_end)
         followups_done = self._shadow_rows("followup_book", today_start, today_end)
@@ -222,7 +250,7 @@ class RollingState:
                 "last_ws_message_age_s": float(round(last_ws_age, 3)),
                 "markets": int(hb_stats.get("markets_covered") or 0),
                 "tokens": int(hb_stats.get("tokens_covered") or 0),
-                "book_rows_this_hour": int(sum(1 for r in self.book_rows if r.get("type") == "book" and (parse_ts(r.get("ts")) or today_start) >= hour_start)),
+                "book_rows_this_hour": int(self.book_count_hour),
                 "mb_per_day": float(disk.get("compressed_mb_per_day") or 0.0),
                 "retention_days": int(disk.get("retention_days") or CONFIG.retention_days),
                 "retention_gb": float(disk.get("retention_gb") or 0.0),
@@ -259,15 +287,11 @@ class RollingState:
         return list(reversed(out))
 
     def _last_ws_ts(self) -> datetime | None:
-        vals = [parse_ts(r.get("ts")) for r in self.book_rows if r.get("type") == "book" and r.get("source") == "websocket"]
-        vals = [v for v in vals if v]
-        return max(vals) if vals else None
+        return self.last_ws_ts
 
     def _gaps_between(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for r in self.book_rows:
-            if r.get("type") != "gap":
-                continue
+        for r in self.gap_rows:
             ts = parse_ts(r.get("end_ts") or r.get("ts"))
             if not ts or ts < start or ts >= end:
                 continue
@@ -364,6 +388,11 @@ class RollingState:
 
 STATE = RollingState()
 
+# Cache paper_status() — it loads the full ledger into memory. /api/paper is polled
+# every ~60s by the discord monitor, so refresh at most every PAPER_CACHE_TTL.
+_PAPER_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
+PAPER_CACHE_TTL = 5.0
+
 
 def dashboard_response() -> FileResponse:
     if not DASHBOARD_FILE.exists():
@@ -393,7 +422,11 @@ def get_gaps(days: int = Query(7, ge=1, le=14)) -> list[dict[str, Any]]:
 
 @app.get("/api/paper")
 def get_paper() -> dict[str, Any]:
-    return paper_status()
+    now_ts = time.time()
+    if now_ts - _PAPER_CACHE["ts"] > PAPER_CACHE_TTL:
+        _PAPER_CACHE["data"] = paper_status()
+        _PAPER_CACHE["ts"] = now_ts
+    return _PAPER_CACHE["data"]
 
 
 def main() -> None:
