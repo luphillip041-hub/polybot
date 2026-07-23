@@ -324,9 +324,12 @@ def market_resolution_soon(book: dict[str, Any], now: datetime) -> bool:
 def reject_reasons(row: dict[str, Any], cfg: PaperConfig, archive_cfg: ArchiveConfig, state: dict[str, Any]) -> list[str]:
     reasons: list[str] = []
     wallet = str(row.get("wallet") or "").lower()
-    allowlist = load_allowlist(cfg.allowlist_path)
-    if wallet not in allowlist:
-        reasons.append("wallet_not_allowlisted")
+    # REMOVED 2026-07-23 (per review): wallet_not_allowlisted rejection.
+    # allowlist.json now includes all 5 configured wallets; exclusion is a tag (eligible_live)
+    # not a gate, so observation keeps every wallet's signals.
+    # allowlist = load_allowlist(cfg.allowlist_path)
+    # if wallet not in allowlist:
+    #     reasons.append("wallet_not_allowlisted")
     fill_ts = parse_ts(row.get("fill_timestamp") or (row.get("trade") or {}).get("timestamp"))
     detect_ts = parse_ts(row.get("ts")) or utc_now()
     if fill_ts and (detect_ts - fill_ts).total_seconds() > cfg.stale_fill_seconds:
@@ -342,12 +345,14 @@ def reject_reasons(row: dict[str, Any], cfg: PaperConfig, archive_cfg: ArchiveCo
     side = side_norm(row.get("fill_side") or (row.get("trade") or {}).get("side"))
     if side not in {"BUY", "SELL"}:
         reasons.append("unknown_side")
-    # Lottery-ticket filter: skip BUYs where the wallet filled below 10¢.
-    # On the 5d sample these two trades alone were 84% of total PnL — pure variance,
-    # not edge. SELLs are unaffected so we still close any 5¢ positions we may already hold.
-    fill_price = row.get("fill_price")
-    if side == "BUY" and fill_price is not None and num(fill_price) < 0.10:
-        reasons.append("lottery_price_band")
+    # Lottery-ticket check: REVERTED 2026-07-23 (per review) from gate to tag.
+    # The 5d sample showed two <10¢ trades were 84% of PnL — pure variance — so the filter
+    # still exists at execution via eligible_live, but observation now keeps the rows so we can
+    # re-derive the band's behavior without another 30d wait. SELLs are unaffected (handled
+    # by is_lottery_band below; called from process_fill so rejection reason stays separately).
+    # fill_price = row.get("fill_price")
+    # if side == "BUY" and fill_price is not None and num(fill_price) < 0.10:
+    #     reasons.append("lottery_price_band")
     if top3_notional(book, side if side in {"BUY", "SELL"} else "BUY") < cfg.stake_usd * cfg.min_top3_liquidity_multiple:
         reasons.append("illiquid_depth")
     if market_resolution_soon(book, detect_ts):
@@ -362,6 +367,16 @@ def reject_reasons(row: dict[str, Any], cfg: PaperConfig, archive_cfg: ArchiveCo
     if side == "SELL" and position_key(wallet, token) not in state.get("positions", {}):
         reasons.append("sell_no_position")
     return reasons
+
+
+def is_lottery_band(row: dict[str, Any]) -> bool:
+    """Tag-only check (2026-07-23): returns True for BUY fills below 10¢.
+    Doesn't gate execution directly — process_fill() consults this and tags the row
+    eligible_live=False (with type='ineligible'), preserving the original observation
+    data so the band's behavior can be re-derived from the ledger without rerunning."""
+    fill_price = row.get("fill_price") or (row.get("trade") or {}).get("price")
+    side = side_norm(row.get("fill_side") or (row.get("trade") or {}).get("side"))
+    return side == "BUY" and fill_price is not None and num(fill_price) < 0.10
 
 
 class PaperFollowerDaemon:
@@ -398,6 +413,7 @@ class PaperFollowerDaemon:
             "reject_reason": None,
             "position_id": None,
             "pnl": None,
+            "eligible_live": True,  # overridden in process_fill; True means execution-path-eligible
             "trade_id": tid,
         }
 
@@ -411,13 +427,22 @@ class PaperFollowerDaemon:
         latency = (detect_ts - fill_ts).total_seconds() if fill_ts else None
         out = [self.signal_row(row, tid, latency)]
         reasons = reject_reasons(row, self.cfg, self.archive_cfg, self.state)
+        lottery = is_lottery_band(row)
+        eligible_live = (len(reasons) == 0) and not lottery
+        out[0]["eligible_live"] = eligible_live
         wallet = str(row.get("wallet") or "").lower()
         book = row.get("book_at_detection") if isinstance(row.get("book_at_detection"), dict) else {}
         snap = book_snapshot(book)
         token = str(trade.get("asset") or book.get("token_id") or "")
         side = side_norm(row.get("fill_side") or trade.get("side"))
         if reasons:
+            # Hard rejection (illiquid, stale, etc.) — unchanged behavior; existing reject_type intact.
             rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": ",".join(reasons), "book_snapshot": snap})
+            out.append(rej)
+        elif lottery:
+            # Lottery band — reverted 2026-07-23 from reject to tag. Logged with eligible_live=False
+            # and type='ineligible' so it's distinguishable from hard rejects. Row preserved in ledger.
+            rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "ineligible", "reject_reason": "lottery_price_band", "book_snapshot": snap})
             out.append(rej)
         elif accepts_today >= self.cfg.max_signals_per_day:
             rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": "daily_entry_cap", "book_snapshot": snap})
