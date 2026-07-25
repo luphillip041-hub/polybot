@@ -37,7 +37,7 @@ import statistics
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Protocol
 
@@ -59,7 +59,11 @@ F_TS = "ts"
 # F_SIZE: not present in ledger. Latency haircut is opt-in via
 # --with-haircut and currently a no-op (see CLI warning).
 
-NOTIONALS = [100, 500, 1000, 5000, 10000]
+# Default notional grid; override via --notionals. Wider grid than the
+# original [100, 500, 1000, 5000, 10000] because the coarse grid
+# fabricated a "$100 wall" at the 80% crossing (D1 finding).
+NOTIONALS_DEFAULT_STR = "100,150,250,400,600,800,1000,5000,10000"
+NOTIONALS = [int(x) for x in NOTIONALS_DEFAULT_STR.split(",")]
 PRICE_BUCKETS = [
     (0.0, 0.10, "<10c"),
     (0.10, 0.30, "10-30c"),
@@ -310,8 +314,16 @@ def walk(
 
 
 def analyze(
-    fills: list[dict], src: BookSource, budget_ticks: float, haircut: bool
+    fills: list[dict],
+    src: BookSource,
+    notionals: list[int],
+    haircut: bool,
 ) -> dict:
+    """Walk the ladder once per fill, store slip_ticks AND slip_pct per notional.
+
+    Curve building is done separately by make_curve() for each budget unit,
+    so this function is unit-agnostic.
+    """
     rows: list[dict] = []
     gaps = 0
     top3_used = 0
@@ -333,67 +345,126 @@ def analyze(
             "side": f["side"],
             "best": best,
             "is_top3_only": book.get("is_top3_only", False),
+            "cells": {},
         }
-        for n in NOTIONALS:
+        for n in notionals:
             res = walk(ladder, n, skip)
             if res is None:
-                rec[str(n)] = None
+                rec["cells"][str(n)] = None
                 continue
             vwap = res[0]
             slip = (vwap - best) if f["side"] == "BUY" else (best - vwap)
-            rec[str(n)] = {
+            rec["cells"][str(n)] = {
                 "vwap": round(vwap, 5),
                 "slip_cents": round(slip * 100, 3),
                 "slip_ticks": round(slip / tick, 2),
-                "ok": (slip / tick) <= budget_ticks,
+                "slip_pct": round(slip / best, 5) if best > 0 else None,
             }
         rows.append(rec)
         if rec["is_top3_only"]:
             top3_used += 1
 
-    curve: dict[str, dict[str, dict]] = {}
-    for scope in ["ALL"] + [b[2] for b in PRICE_BUCKETS]:
-        subset = rows if scope == "ALL" else [r for r in rows if r["bucket"] == scope]
-        if not subset:
-            continue
-        scope_cells: dict[str, dict] = {}
-        for n in NOTIONALS:
-            cells = [r[str(n)] for r in subset]
-            ok = [c for c in cells if c and c["ok"]]
-            slips = sorted(c["slip_ticks"] for c in cells if c)
-            scope_cells[str(n)] = {
-                "n_signals": len(cells),
-                "pct_fillable": round(100 * len(ok) / len(cells), 1),
-                "median_slip_ticks": round(statistics.median(slips), 2)
-                if slips
-                else None,
-                "p80_slip_ticks": (
-                    round(slips[int(0.8 * (len(slips) - 1))], 2) if slips else None
-                ),
-                "ladder_exhausted": sum(1 for c in cells if c is None),
-            }
-        curve[scope] = scope_cells
-
     return {
-        "curve": curve,
         "rows": rows,
         "n_fills": len(fills),
         "n_analyzed": len(rows),
         "n_book_gaps": gaps,
         "n_top3_only_used": top3_used,
-        "budget_ticks": budget_ticks,
         "latency_haircut": haircut,
     }
 
 
-def deployable(curve: dict, scope: str, threshold: float) -> int | None:
+def make_curve(
+    rows: list[dict],
+    notionals: list[int],
+    budget_value: float,
+    budget_unit: str,
+) -> dict:
+    """Build the fillability curve for one budget unit ('ticks' or 'pct').
+
+    Returns {scope -> {notional_str -> {n_signals, pct_fillable, ...}}}.
+    Median/p80 fields are named per-unit (median_slip_ticks / p80_slip_pct)
+    so downstream readers never confuse units.
+    """
+    assert budget_unit in ("ticks", "pct"), budget_unit
+    slip_key = "slip_ticks" if budget_unit == "ticks" else "slip_pct"
+    median_key = f"median_slip_{budget_unit}"
+    p80_key = f"p80_slip_{budget_unit}"
+
+    curve: dict[str, dict[str, dict]] = {}
+    for scope in ["ALL"] + [b[2] for b in PRICE_BUCKETS]:
+        subset = (
+            rows if scope == "ALL" else [r for r in rows if r["bucket"] == scope]
+        )
+        if not subset:
+            continue
+        scope_cells: dict[str, dict] = {}
+        for n in notionals:
+            cells = [r["cells"].get(str(n)) for r in subset]
+            filled = [c for c in cells if c is not None]
+            ok = [
+                c
+                for c in filled
+                if c.get(slip_key) is not None and c[slip_key] <= budget_value
+            ]
+            slips = sorted(
+                c[slip_key] for c in filled if c.get(slip_key) is not None
+            )
+            scope_cells[str(n)] = {
+                "n_signals": len(cells),
+                "pct_fillable": round(100 * len(ok) / len(cells), 1) if cells else 0,
+                median_key: round(statistics.median(slips), 4) if slips else None,
+                p80_key: (
+                    round(slips[int(0.8 * (len(slips) - 1))], 4) if slips else None
+                ),
+                "ladder_exhausted": sum(1 for c in cells if c is None),
+            }
+        curve[scope] = scope_cells
+    return curve
+
+
+def deployable(curve: dict, scope: str, threshold: float, notionals: list[int]) -> int | None:
     """Largest notional where >= `threshold`% of signals fill within budget."""
     best = None
-    for n in NOTIONALS:
+    for n in notionals:
         c = curve.get(scope, {}).get(str(n))
         if c and c["pct_fillable"] >= threshold:
             best = n
     return best
+
+
+def _parse_days_arg(s: str) -> set:
+    """Parse a comma-separated YYYY-MM-DD list into a set of date objects.
+    Empty string or whitespace returns an empty set."""
+    days = set()
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            days.add(datetime.strptime(tok, "%Y-%m-%d").date())
+        except ValueError as e:
+            raise SystemExit(f"--include-days: bad date '{tok}': {e}")
+    return days
+
+
+def _parse_notionals_arg(s: str) -> list[int]:
+    """Parse a comma-separated int list. Empty string -> default grid."""
+    if not s.strip():
+        return list(NOTIONALS)
+    out = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            v = int(tok)
+        except ValueError as e:
+            raise SystemExit(f"--notionals: bad integer '{tok}': {e}")
+        if v <= 0:
+            raise SystemExit(f"--notionals: notional must be positive, got {v}")
+        out.append(v)
+    return sorted(set(out))
 
 
 def main() -> int:
@@ -408,7 +479,13 @@ def main() -> int:
     ap.add_argument(
         "--archive-root", type=Path, default=Path("runs/book_archive")
     )
-    ap.add_argument("--budget-ticks", type=float, default=2.0)
+    ap.add_argument("--budget-ticks", type=float, default=2.0,
+                    help="slippage budget in ticks (default 2.0). Use 0 to disable.")
+    ap.add_argument("--budget-pct", type=float, default=None,
+                    help="slippage budget as %% of price (e.g. 0.02 for 2%%). "
+                    "Optional; when supplied alongside --budget-ticks, the "
+                    "report emits a fillability curve under EACH unit. "
+                    "Each curve carries a budget_unit field.")
     ap.add_argument(
         "--threshold",
         type=float,
@@ -435,23 +512,45 @@ def main() -> int:
         "from prior session). Pass empty string to disable.",
     )
     ap.add_argument(
+        "--include-days",
+        default="",
+        help="comma-separated YYYY-MM-DD list. Restrict analysis to fills on "
+        "these dates (UTC). If empty, all dates within --days are used. "
+        "Used to exclude archive-gap days (D4 finding) so the surviving "
+        "sample is unbiased within itself.",
+    )
+    ap.add_argument(
+        "--notionals",
+        default=NOTIONALS_DEFAULT_STR,
+        help=f"comma-separated notional grid. Default: {NOTIONALS_DEFAULT_STR}",
+    )
+    ap.add_argument(
         "--out", type=Path, default=Path("capacity_report.json")
     )
     args = ap.parse_args()
+
+    if args.budget_ticks == 0 and args.budget_pct is None:
+        raise SystemExit("at least one of --budget-ticks / --budget-pct must be > 0")
 
     suspect_before = (
         parse_ts(args.suspect_before) if args.suspect_before else None
     )
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
     sides = {s.strip().upper() for s in args.sides.split(",")}
+    include_days = _parse_days_arg(args.include_days)
+    notionals = _parse_notionals_arg(args.notionals)
 
     fills: list[dict] = []
     parse_errors = 0
+    raw_row_count = 0
+    fill_min_ts: datetime | None = None
+    fill_max_ts: datetime | None = None
     with args.ledger.open() as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
+            raw_row_count += 1
             try:
                 r = json.loads(line)
                 # any row with wallet_fill_price set is a real wallet fill,
@@ -463,6 +562,12 @@ def main() -> int:
                     continue
                 if str(r[F_SIDE]).upper() not in sides:
                     continue
+                if include_days and ts.date() not in include_days:
+                    continue
+                if fill_min_ts is None or ts < fill_min_ts:
+                    fill_min_ts = ts
+                if fill_max_ts is None or ts > fill_max_ts:
+                    fill_max_ts = ts
                 fills.append(
                     {
                         "wallet": r.get(F_WALLET),
@@ -481,16 +586,24 @@ def main() -> int:
 
     if not fills:
         print(
-            "no fills matched — check the F_* field mapping at the top of this file",
+            "no fills matched — check the F_* field mapping / window filter",
             file=sys.stderr,
         )
         return 1
 
     n_tokens = len({f["token"] for f in fills})
+    days_in_use = sorted({f["ts"].date() for f in fills})
     print(
-        f"{len(fills)} fills over {args.days}d, {n_tokens} tokens"
-        + (f" ({parse_errors} parse errors skipped)" if parse_errors else "")
+        f"{len(fills)} fills over {args.days}d, {n_tokens} tokens, "
+        f"{len(days_in_use)} days "
+        + (f"({parse_errors} parse errors skipped)" if parse_errors else "")
     )
+    if include_days:
+        print(
+            f"  --include-days: {sorted(include_days)} ({len(include_days)} requested, "
+            f"{len(days_in_use)} had fills)",
+            file=sys.stderr,
+        )
 
     if args.source == "live":
         print(
@@ -520,35 +633,125 @@ def main() -> int:
     else:
         haircut = False
 
-    rep = analyze(fills, src, args.budget_ticks, haircut=haircut)
-    args.out.write_text(json.dumps(rep, indent=2))
+    analysis = analyze(fills, src, notionals, haircut)
 
+    # Build fillability curve(s) — one per requested budget unit.
+    curves: dict[str, dict] = {}
+    if args.budget_ticks and args.budget_ticks > 0:
+        curves["ticks"] = {
+            "budget_unit": "ticks",
+            "budget_value": args.budget_ticks,
+            "curve": make_curve(analysis["rows"], notionals, args.budget_ticks, "ticks"),
+        }
+    if args.budget_pct is not None:
+        curves["pct"] = {
+            "budget_unit": "pct",
+            "budget_value": args.budget_pct,
+            "curve": make_curve(analysis["rows"], notionals, args.budget_pct, "pct"),
+        }
+
+    # Scope limitation that travels with the report itself (not just chat).
+    scope_limitations = [
+        (
+            "W95 is the clean run: D4 restricted to its 6-day window with no "
+            "flagged age residual. W70 adds 2026-07-11 and 2026-07-16 as "
+            "partial days, which leaves a real age-residual tail "
+            "(KS 0.527 on day-of-week); W70 AGREES ON SHAPE but is not "
+            "independently clean — treat it as sensitivity, not as a "
+            "second result. Both windows exclude 2026-07-22, which is 2,472 "
+            "fills (the single largest day in the dataset), arriving "
+            "immediately after a five-day stretch (2026-07-17 through "
+            "2026-07-21) where all five tracked wallets were idle. That "
+            "pattern reads as a distinct regime; the figures here describe "
+            "capacity on quiet days. The highest-activity day in the set "
+            "has no usable book coverage and is not represented. B3 "
+            "(D4 restricted to the chosen window) is the validity gate; if "
+            "residual bias is acceptable, these numbers apply."
+        ),
+    ]
+
+    report = {
+        "schema_version": "B",
+        "ledger_snapshot": {
+            "ledger_path": str(args.ledger),
+            "raw_row_count": raw_row_count,
+            "n_fills": len(fills),
+            "fill_min_ts": fill_min_ts.isoformat() if fill_min_ts else None,
+            "fill_max_ts": fill_max_ts.isoformat() if fill_max_ts else None,
+            "resolved_days": [d.isoformat() for d in days_in_use],
+        },
+        "window": {
+            "include_days_requested": (
+                [d.isoformat() for d in sorted(include_days)]
+                if include_days else None
+            ),
+            "n_days_requested": len(include_days),
+            "days_in_window": len(days_in_use),
+            "notionals": notionals,
+            "budget_units": list(curves.keys()),
+            "budget_ticks": args.budget_ticks if "ticks" in curves else None,
+            "budget_pct": args.budget_pct if "pct" in curves else None,
+            "tolerance_minutes": args.tolerance_minutes,
+            "suspect_before": args.suspect_before,
+            "source": args.source,
+            "days_filter": args.days,
+        },
+        "scope_limitations": scope_limitations,
+        "n_fills": analysis["n_fills"],
+        "n_analyzed": analysis["n_analyzed"],
+        "n_book_gaps": analysis["n_book_gaps"],
+        "n_top3_only_used": analysis["n_top3_only_used"],
+        "latency_haircut": analysis["latency_haircut"],
+        "curves": curves,
+        "rows": analysis["rows"],
+    }
+    def _json_default(obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, date):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+    args.out.write_text(json.dumps(report, indent=2, default=_json_default))
+
+    # Stdout: per-budget-unit grid + deployable
     print(
-        f"\nanalyzed {rep['n_analyzed']}/{rep['n_fills']} "
-        f"({rep['n_book_gaps']} book gaps, "
-        f"{rep['n_top3_only_used']} top-3-only books) | "
-        f"budget {args.budget_ticks} ticks | haircut {rep['latency_haircut']}\n"
+        f"\nanalyzed {analysis['n_analyzed']}/{analysis['n_fills']} "
+        f"({analysis['n_book_gaps']} book gaps, "
+        f"{analysis['n_top3_only_used']} top-3-only books) | "
+        f"haircut {analysis['latency_haircut']} | "
+        f"notionals {notionals} | "
+        f"budget_units {list(curves.keys())}\n"
     )
 
-    hdr = f"{'scope':<10}" + "".join(f"{'$'+str(n):>12}" for n in NOTIONALS)
-    print(hdr)
-    print("-" * len(hdr))
-    for scope, cells in rep["curve"].items():
-        line = f"{scope:<10}"
-        for n in NOTIONALS:
-            c = cells.get(str(n))
-            line += f"{(str(c['pct_fillable'])+'%') if c else '-':>12}"
-        print(line)
-    print("\n(cells = % of signals fillable within budget)\n")
-
-    for scope in rep["curve"]:
-        d = deployable(rep["curve"], scope, args.threshold)
-        print(
-            f" max deployable notional @ {args.threshold:.0f}% fill, {scope}: "
-            f"{('$'+str(d)) if d else 'below $'+str(NOTIONALS[0])}"
+    for unit_name, unit_data in curves.items():
+        bv = unit_data["budget_value"]
+        curve = unit_data["curve"]
+        hdr = (
+            f"{unit_name.upper()} budget = {bv}    "
+            f"(cells = % of signals fillable within budget)\n"
+            f"{'scope':<10}"
+            + "".join(f"{'$'+str(n):>12}" for n in notionals)
         )
+        print(hdr)
+        print("-" * len(hdr))
+        for scope, cells in curve.items():
+            line = f"{scope:<10}"
+            for n in notionals:
+                c = cells.get(str(n))
+                line += f"{(str(c['pct_fillable'])+'%') if c else '-':>12}"
+            print(line)
+        print()
+        for scope in curve:
+            d = deployable(curve, scope, args.threshold, notionals)
+            print(
+                f" max deployable notional @ {args.threshold:.0f}% fill, "
+                f"{unit_name}={bv}, {scope}: "
+                f"{('$'+str(d)) if d else 'below $'+str(notionals[0])}"
+            )
+        print()
 
-    print(f"\nwrote {args.out}")
+    print(f"wrote {args.out}")
     print(
         "\nNOTE: archive stores only top-3 asks/bids. Capacity reported\n"
         "  here is 'fillable within visible top-3 depth' — an UPPER bound\n"
