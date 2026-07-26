@@ -43,6 +43,11 @@ class ArchiveConfig:
         "MAX_WRITE_INTERVAL_SEC", 30.0
     )
     heartbeat_interval_seconds: int = _env_int("HEARTBEAT_INTERVAL_SEC", 60)
+    # Periodic gamma refresh: scans active gamma events and proactively adds
+    # newly-tradable markets to the archive universe on top of the existing
+    # top-N baseline. Closes the 07-22-style gap where wallets trade tokens
+    # before the archive subscribes (D4 finding: universe_add lagged fills).
+    gamma_refresh_interval_seconds: int = _env_int("GAMMA_REFRESH_INTERVAL_SEC", 600)
     max_tokens: int = _env_int("MAX_TOKENS", 800)
     archive_dir: Path = CONFIG.runs_dir / "book_archive"
     state_path: Path = CONFIG.runs_dir / "shadow_journal_state.json"

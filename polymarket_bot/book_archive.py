@@ -136,6 +136,10 @@ class BookArchiveDaemon:
         self.ws_stale_timeout_seconds = float(os.getenv("POLYMARKET_WS_STALE_TIMEOUT_SECONDS", "60"))
         self.wallet_driven_tokens: set[str] = set()
         self.wallet_trade_seen_tokens: set[str] = set()
+        # Tokens discovered by the gamma-refresh loop (additive path; survives
+        # the periodic top-N rebuild in discover_markets()).
+        self.gamma_discovered_tokens: set[str] = set()
+        self.gamma_discovered_meta: dict[str, dict[str, Any]] = {}
         self._wallet_seed_done: bool = False
         self._snapshot_failed_tokens: dict[str, int] = {}
         self._ws_reconnect_requested: bool = False
@@ -307,6 +311,8 @@ class BookArchiveDaemon:
                 }
         # Restore wallet-driven tokens post refresh
         self._restore_wallet_driven_tokens()
+        # Restore gamma-discovered tokens post refresh (proactive new-market add)
+        self._restore_gamma_discovered_tokens()
         # Apply token ceiling
         self._evict_excess_tokens()
         self.stats.markets_covered = len(selected)
@@ -328,6 +334,101 @@ class BookArchiveDaemon:
         for token_id in self.wallet_driven_tokens:
             if token_id not in self.token_meta:
                 self.token_meta[token_id] = {"token_id": token_id, "wallet_driven": True}
+
+    def _restore_gamma_discovered_tokens(self) -> None:
+        """Re-add gamma-discovered tokens that were cleared by discover_markets().
+        These are tokens added proactively by the gamma-refresh loop, not via
+        wallet signal. They survive the top-N rebuild so the archive doesn't
+        lose them on the next market_refresh_loop tick."""
+        for token_id, meta in self.gamma_discovered_meta.items():
+            if token_id not in self.token_meta:
+                self.token_meta[token_id] = meta
+
+    def _discover_new_gamma_tokens(self) -> None:
+        """Proactively add newly-active gamma markets on top of the existing
+        top-N baseline. Runs alongside market_refresh_loop.
+
+        Why this exists: discover_markets() takes only top_n_markets=10 sorted
+        by (liquidity, volume_24h, volume). Brand-new markets with low starting
+        liquidity never make that cut and only enter the universe via wallet-
+        driven signal — AFTER the wallet's first trade. On 07-22 that lag
+        dropped 346 tokens (1,230 fills) from the capacity analysis because
+        the daemon only learned about them when wallets already traded them.
+
+        This path runs on a faster cadence and ADDs without removing. Cap by
+        max_tokens; gamma-discovered tokens are evicted first if the ceiling
+        binds (wallet-driven tokens are never evicted).
+        """
+        try:
+            events = active_events(limit=self.config.gamma_event_limit)
+            markets = flatten_markets(events)
+        except Exception:
+            LOG.exception("gamma discovery fetch failed")
+            return
+
+        tradable = [
+            m for m in markets
+            if m.get("enable_order_book")
+            and m.get("active") is not False
+            and m.get("closed") is not True
+            and token_ids_for_market(m)
+        ]
+
+        added = 0
+        for market in tradable:
+            if len(self.token_meta) >= self.config.max_tokens:
+                break
+            condition = market.get("condition_id") or market.get("conditionId")
+            if condition:
+                self.market_condition_ids.add(str(condition).lower())
+            outcomes = market.get("outcomes") or []
+            for idx, token_id in enumerate(token_ids_for_market(market)):
+                if token_id in self.token_meta:
+                    continue
+                meta = {
+                    "token_id": token_id,
+                    "market_id": market.get("market_id"),
+                    "market_slug": market.get("market_slug"),
+                    "event_slug": market.get("event_slug"),
+                    "question": market.get("question"),
+                    "outcome": str(outcomes[idx]) if idx < len(outcomes) else None,
+                    "liquidity": market.get("liquidity"),
+                    "volume_24h": market.get("volume_24h"),
+                    "gamma_discovered": True,
+                }
+                self.token_meta[token_id] = meta
+                self.gamma_discovered_tokens.add(token_id)
+                self.gamma_discovered_meta[token_id] = meta
+                added += 1
+                LOG.info(
+                    "universe_add token=%s wallet_driven=False gamma_discovered=True condition_id=%s tokens_total=%s",
+                    token_id[:12], condition, len(self.token_meta),
+                )
+
+        if added > 0:
+            self._ws_reconnect_requested = True
+            self.stats.tokens_covered = len(self.token_meta)
+            write_json(
+                self.config.archive_dir / "markets_latest.json",
+                {"ts": iso_now(), "markets": [], "tokens": self.token_meta},
+            )
+            LOG.info(
+                "gamma refresh added=%s universe_size=%s gamma_discovered_total=%s",
+                added, len(self.token_meta), len(self.gamma_discovered_tokens),
+            )
+
+    async def gamma_refresh_loop(self) -> None:
+        """Periodic scan that adds newly-active gamma markets to the archive
+        universe without disturbing the top-N baseline. Runs alongside
+        market_refresh_loop and the wallet/WS cycles."""
+        # Stagger first run so it doesn't fire on the same tick as discover_markets().
+        await self._sleep(min(30.0, float(self.config.gamma_refresh_interval_seconds)))
+        while self.running:
+            try:
+                self._discover_new_gamma_tokens()
+            except Exception:
+                LOG.exception("gamma refresh failed")
+            await self._sleep(self.config.gamma_refresh_interval_seconds)
 
     def _evict_excess_tokens(self) -> None:
         """Keep total tokens under max_tokens ceiling.
@@ -772,7 +873,7 @@ class BookArchiveDaemon:
             except NotImplementedError:
                 pass
         try:
-            await asyncio.gather(self.ws_loop(), self.snapshot_loop(), self.wallet_loop(), self.flush_loop(), self.heartbeat_loop(), self.market_refresh_loop())
+            await asyncio.gather(self.ws_loop(), self.snapshot_loop(), self.wallet_loop(), self.flush_loop(), self.heartbeat_loop(), self.market_refresh_loop(), self.gamma_refresh_loop())
         finally:
             self.flush_all()
 
