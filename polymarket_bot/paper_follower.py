@@ -14,7 +14,7 @@ from typing import Any
 
 from .archive_config import ArchiveConfig
 from .book_archive import trade_id
-from .config import BotConfig
+from .config import BotConfig, CONFIG
 from .alerts import send_telegram
 from .resolution import TokenMap, resolved_outcome_for_token as _onchain_resolved_outcome_for_token, RpcClient
 
@@ -174,6 +174,73 @@ def book_snapshot(book: dict[str, Any] | None) -> dict[str, Any]:
         "ask_size": book.get("best_ask_size"),
         "spread": book.get("spread"),
     }
+
+
+# Cache for live REST BBO backstop. Tokens we fetched live get cached for
+# BBO_BACKSTOP_TTL_SEC so we don't double-snap. Helps paper fills that arrive
+# before the archive WS catches up — eliminates most no_archived_book rejects.
+_BBO_BACKSTOP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+BBO_BACKSTOP_TTL_SEC = 30.0
+
+
+def _clean_bbo_cache() -> None:
+    """Drop expired entries from the backstop cache."""
+    now = time.time()
+    expired = [t for t, (ts, _) in _BBO_BACKSTOP_CACHE.items() if now - ts > BBO_BACKSTOP_TTL_SEC]
+    for t in expired:
+        _BBO_BACKSTOP_CACHE.pop(t, None)
+
+
+def rest_backstop_bbo(token: str) -> dict[str, Any] | None:
+    """Hit CLOB REST for a fresh BBO when archive hasn't caught up.
+
+    Returns a normalized book dict compatible with book_snapshot() (keys
+    best_bid, best_ask, best_bid_size, best_ask_size, spread). Cached for
+    30s so multiple signals for the same token don't re-snap.
+
+    Returns None on REST failure (e.g., dead token, network error).
+    """
+    from .clob import best_bid_ask as _best_bid_ask
+    _clean_bbo_cache()
+    if not token:
+        return None
+    cached = _BBO_BACKSTOP_CACHE.get(token)
+    if cached:
+        return cached[1]
+    try:
+        result = _best_bid_ask(token)
+        if not result.get("ok"):
+            return None
+        bid = result.get("best_bid")
+        ask = result.get("best_ask")
+        if bid is None or ask is None:
+            return None
+        # Estimate top-of-book size (CLOB REST /book only has price levels;
+        # use min_order_size as proxy for size, or a fixed liquidity marker)
+        from .http import get_json
+        try:
+            book = get_json(CONFIG.clob_base, "/book", {"token_id": token}, user_agent=CONFIG.user_agent)
+            bids = book.get("bids") or []
+            asks = book.get("asks") or []
+            bid_size = float(bids[0]["size"]) if bids else 100.0
+            ask_size = float(asks[0]["size"]) if asks else 100.0
+        except Exception:
+            bid_size = ask_size = 100.0  # conservative default
+        spread = ask - bid
+        snap = {
+            "best_bid": bid,
+            "best_ask": ask,
+            "best_bid_size": bid_size,
+            "best_ask_size": ask_size,
+            "spread": spread,
+            "token_id": token,
+            "_source": "rest_backstop",
+        }
+        _BBO_BACKSTOP_CACHE[token] = (time.time(), snap)
+        return snap
+    except Exception:
+        LOG.warning("rest_backstop_bbo failed for token=%s", token[:12])
+        return None
 
 
 def top3_notional(book: dict[str, Any], side: str) -> float:
@@ -415,6 +482,31 @@ def is_lottery_band(row: dict[str, Any]) -> bool:
     return side == "BUY" and fill_price is not None and num(fill_price) < 0.10
 
 
+# Path to a small JSON file the paper-follower writes tokens to that need
+# archive WS priority. Book archive reads it on each refresh cycle and adds
+# new tokens to its wallet_driven queue. Live coupling without dependencies.
+ARCHIVE_PRIORITY_FILE = Path(__file__).resolve().parents[1] / "runs" / "paper" / "archive_priority.jsonl"
+ARCHIVE_PRIORITY_TTL_SEC = 600  # 10 min before archive picks up
+
+
+def _flag_token_for_archive_fn(token: str) -> None:
+    """Append a token to the archive priority file with a TTL marker.
+
+    Archive daemon reads this file each cycle and adds fresh tokens to
+    its wallet_driven queue (which forces a WS subscribe). Decoupled —
+    no direct import. The archive daemon picks it up on its next tick.
+    """
+    if not token:
+        return
+    try:
+        ARCHIVE_PRIORITY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"token": token, "ts": time.time()}
+        with ARCHIVE_PRIORITY_FILE.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 class PaperFollowerDaemon:
     def __init__(self, cfg: PaperConfig | None = None, archive_cfg: ArchiveConfig | None = None) -> None:
         self.cfg = cfg or PaperConfig.load()
@@ -462,12 +554,26 @@ class PaperFollowerDaemon:
         fill_ts = parse_ts(row.get("fill_timestamp") or trade.get("timestamp"))
         latency = (detect_ts - fill_ts).total_seconds() if fill_ts else None
         out = [self.signal_row(row, tid, latency)]
+        # Backstop BBO: if archive hasn't caught up yet, hit CLOB REST once
+        # (cached for 30s by token) so the signal can pass rejection checks
+        book = row.get("book_at_detection") if isinstance(row.get("book_at_detection"), dict) else {}
+        if not book:
+            _token = str(trade.get("asset") or book.get("token_id") or "")
+            backstop = rest_backstop_bbo(_token)
+            if backstop:
+                row["book_at_detection"] = backstop
+                book = backstop
+        book = book or {}
+        # Tell the archive daemon to prioritize this token for WS subscription
+        if not row.get("book_at_detection") or row.get("book_at_detection", {}).get("_source") == "rest_backstop":
+            _token_for_archive = str(trade.get("asset") or book.get("token_id") or "")
+            if _token_for_archive:
+                _flag_token_for_archive_fn(_token_for_archive)
         reasons = reject_reasons(row, self.cfg, self.archive_cfg, self.state)
         lottery = is_lottery_band(row)
         eligible_live = (len(reasons) == 0) and not lottery
         out[0]["eligible_live"] = eligible_live
         wallet = str(row.get("wallet") or "").lower()
-        book = row.get("book_at_detection") if isinstance(row.get("book_at_detection"), dict) else {}
         snap = book_snapshot(book)
         token = str(trade.get("asset") or book.get("token_id") or "")
         side = side_norm(row.get("fill_side") or trade.get("side"))

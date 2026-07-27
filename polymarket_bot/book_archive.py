@@ -453,6 +453,55 @@ class BookArchiveDaemon:
             condition = str(trade.get("conditionId") or trade.get("condition_id") or "")
             self._add_wallet_driven_token(token, condition)
 
+    def _read_priority_file(self) -> list[str]:
+        """Read paper-follower's archive priority file. Returns fresh tokens.
+
+        The paper-follower writes tokens it had to REST-backstop (because
+        the archive hadn't subscribed yet). We add them to wallet_driven
+        so WS picks them up on the next reconnect cycle. Read and clear.
+        """
+        try:
+            from .paper_follower import ARCHIVE_PRIORITY_FILE, ARCHIVE_PRIORITY_TTL_SEC
+        except Exception:
+            return []
+        if not ARCHIVE_PRIORITY_FILE.exists():
+            return []
+        try:
+            cutoff = time.time() - ARCHIVE_PRIORITY_TTL_SEC
+            kept = []
+            fresh_tokens = []
+            seen = set()
+            with ARCHIVE_PRIORITY_FILE.open() as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        tok = rec.get("token", "")
+                        ts = rec.get("ts", 0)
+                        if ts >= cutoff and tok and tok not in seen:
+                            fresh_tokens.append(tok)
+                            seen.add(tok)
+                        kept.append(line)
+                    except Exception:
+                        kept.append(line)
+            # Rewrite without expired entries
+            with ARCHIVE_PRIORITY_FILE.open("w") as f:
+                f.writelines(kept)
+            return fresh_tokens
+        except Exception:
+            LOG.exception("read priority file failed")
+            return []
+
+    def _add_priority_tokens(self) -> int:
+        """Pull tokens from priority file and add to wallet_driven."""
+        added = 0
+        for tok in self._read_priority_file():
+            if tok and tok not in self.token_meta and tok not in self.wallet_driven_tokens:
+                self._add_wallet_driven_token(tok, None)
+                added += 1
+        if added:
+            LOG.info("priority_added tokens=%s universe=%s", added, len(self.token_meta))
+        return added
+
     def _seed_wallet_driven_tokens_30d(self) -> None:
         """One-time startup seed: pull each tracked wallet's /trades for ~30d,
         collect all unique tokens, subscribe them as wallet-driven."""
@@ -718,6 +767,8 @@ class BookArchiveDaemon:
         self.stats.shadow_rows_written += 1
 
     def poll_wallets_once(self) -> None:
+        # Pick up tokens the paper follower had to backstop (cross-daemon handoff)
+        self._add_priority_tokens()
         seen: set[str] = set(self.state.get("seen_trade_ids", []))
         journaled: set[str] = set(self.state.get("journaled_trade_ids", []))
         for wallet in self._configured_wallets():

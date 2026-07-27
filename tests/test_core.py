@@ -702,3 +702,49 @@ class PaperFollowerMemoryTests(unittest.TestCase):
             self.assertIn("signal_coverage_pct", status)
             self.assertEqual(status["signal_coverage_pct"], 50.0)
 
+    def test_rest_backstop_bbo_returns_none_on_missing(self):
+        """rest_backstop_bbo returns None for empty token."""
+        from polymarket_bot.paper_follower import rest_backstop_bbo
+        result = rest_backstop_bbo("")
+        self.assertIsNone(result)
+
+    def test_rest_backstop_bbo_caches_response(self):
+        """rest_backstop_bbo caches results in _BBO_BACKSTOP_CACHE."""
+        from unittest.mock import patch as mp
+        from polymarket_bot.paper_follower import rest_backstop_bbo, _BBO_BACKSTOP_CACHE
+        _BBO_BACKSTOP_CACHE.clear()
+        with mp("polymarket_bot.clob.best_bid_ask", return_value={"ok": True, "best_bid": 0.5, "best_ask": 0.6, "spread": 0.1}):
+            with mp("polymarket_bot.clob.get_json", return_value={"bids": [{"price": 0.5, "size": 100}], "asks": [{"price": 0.6, "size": 200}]}):
+                r1 = rest_backstop_bbo("111")
+                self.assertIsNotNone(r1)
+                self.assertEqual(r1["best_bid"], 0.5)
+                # Second call should hit cache
+                r2 = rest_backstop_bbo("111")
+                self.assertIsNotNone(r2)
+                self.assertEqual(r2["best_bid"], 0.5)
+
+    def test_archive_priority_file_constant(self):
+        """Archive priority file path resolves to a real path under runs/."""
+        from polymarket_bot.paper_follower import ARCHIVE_PRIORITY_FILE
+        self.assertTrue(str(ARCHIVE_PRIORITY_FILE).endswith("archive_priority.jsonl"))
+
+    def test_flag_token_for_archive_appends(self):
+        """_flag_token_for_archive_fn writes a record to the priority file."""
+        from pathlib import Path
+        from polymarket_bot.paper_follower import _flag_token_for_archive_fn, ARCHIVE_PRIORITY_FILE
+        # Use a temp file path by monkeypatching
+        tmp_path = Path("/tmp/_test_priority.jsonl")
+        original = ARCHIVE_PRIORITY_FILE
+        import polymarket_bot.paper_follower as pf
+        pf.ARCHIVE_PRIORITY_FILE = tmp_path
+        try:
+            tmp_path.unlink(missing_ok=True)
+            _flag_token_for_archive_fn("token_abc")
+            _flag_token_for_archive_fn("token_def")
+            assert tmp_path.exists()
+            content = tmp_path.read_text().strip().split("\n")
+            self.assertEqual(len(content), 2)
+        finally:
+            pf.ARCHIVE_PRIORITY_FILE = original
+            tmp_path.unlink(missing_ok=True)
+
