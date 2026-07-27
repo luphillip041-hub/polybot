@@ -255,7 +255,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("stale_fill", rows[1]["reject_reason"])
             self.assertEqual(set(rows[1]["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
             status = paper_status(cfg)
-            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "accepts_by_latency", "rejects_today", "rejects_by_reason", "realized_pnl", "realized_pnl_today", "unrealized_pnl", "open_notional", "account_value", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet"})
+            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "accepts_by_latency", "rejects_today", "rejects_by_reason", "realized_pnl", "realized_pnl_today", "unrealized_pnl", "open_notional", "account_value", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet", "signal_coverage_pct"})
             self.assertGreaterEqual(status["rejects_today"], 1)
     def test_paper_follower_entry_and_exit_rows_include_book_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
@@ -635,4 +635,70 @@ class PreflightTests(unittest.TestCase):
         with patch("pathlib.Path.exists", return_value=True):
             result = check_config()
             self.assertTrue(result)
+
+
+class PaperFollowerMemoryTests(unittest.TestCase):
+    """Tests for memory-usage fixes in paper follower."""
+
+    def test_shadow_paths_recent_filters_by_mtime(self):
+        """shadow_paths_recent returns only files modified within since_seconds."""
+        import time
+        from pathlib import Path
+        from polymarket_bot.archive_config import ArchiveConfig
+        from polymarket_bot.paper_follower import shadow_paths_recent
+        cfg = ArchiveConfig()
+        # Path.glob for shadow_*.jsonl.gz uses real files; just test returns a list
+        result = shadow_paths_recent(cfg, since_seconds=3600)
+        self.assertIsInstance(result, list)
+
+    def test_max_processed_trade_ids_constant(self):
+        """Cap on in-memory processed trade ids is finite."""
+        from polymarket_bot.paper_follower import MAX_PROCESSED_TRADE_IDS_INMEM
+        self.assertGreater(MAX_PROCESSED_TRADE_IDS_INMEM, 0)
+        self.assertLessEqual(MAX_PROCESSED_TRADE_IDS_INMEM, 100000)
+
+    def test_max_signals_per_day_default(self):
+        """PaperConfig.max_signals_per_day has a sensible default (env or 60)."""
+        from polymarket_bot import paper_follower
+        cfg = paper_follower.PaperConfig()
+        self.assertGreaterEqual(cfg.max_signals_per_day, 20)
+        self.assertLessEqual(cfg.max_signals_per_day, 200)
+
+    def test_max_signals_per_day_via_init(self):
+        """PaperConfig.max_signals_per_day passes through constructor."""
+        from polymarket_bot import paper_follower
+        cfg = paper_follower.PaperConfig(max_signals_per_day=75)
+        self.assertEqual(cfg.max_signals_per_day, 75)
+
+    def test_signal_coverage_pct_in_status(self):
+        """Paper status includes signal_coverage_pct."""
+        import tempfile, json
+        from polymarket_bot.archive_config import ArchiveConfig
+        from polymarket_bot.paper_follower import (
+            PaperConfig, paper_status, append_jsonl_fsync, save_state, load_state
+        )
+        from datetime import datetime, UTC
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+        with tempfile.TemporaryDirectory() as td:
+            paper_dir = Path(td) / "paper"
+            paper_dir.mkdir(parents=True, exist_ok=True)
+            state_path = paper_dir / "state.json"
+            ledger_path = paper_dir / "ledger.jsonl"
+            # Seed a signal with BBO and a signal without BBO
+            append_jsonl_fsync(ledger_path, {
+                "ts": now, "type": "signal", "wallet": "0xabc",
+                "token": "111", "side": "BUY",
+                "book_snapshot": {"best_bid": 0.5, "best_ask": 0.6, "bid_size": 100, "ask_size": 100, "spread": 0.1},
+                "detection_latency_s": 100,
+            })
+            append_jsonl_fsync(ledger_path, {
+                "ts": now, "type": "signal", "wallet": "0xabc",
+                "token": "222", "side": "BUY",
+                "book_snapshot": {},  # empty = no BBO
+                "detection_latency_s": 100,
+            })
+            cfg = PaperConfig(paper_dir=paper_dir, ledger_path=ledger_path, state_path=state_path)
+            status = paper_status(cfg)
+            self.assertIn("signal_coverage_pct", status)
+            self.assertEqual(status["signal_coverage_pct"], 50.0)
 

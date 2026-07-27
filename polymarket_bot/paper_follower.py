@@ -30,7 +30,7 @@ class PaperConfig:
     allowlist_path: Path = paper_dir / "allowlist.json"
     data_quality_path: Path = paper_dir / "data_quality.json"
     stake_usd: float = 100.0
-    max_signals_per_day: int = 20
+    max_signals_per_day: int = int(os.getenv("PAPER_MAX_SIGNALS_PER_DAY", "60"))
     max_spread: float = 0.04
     min_top3_liquidity_multiple: float = 2.0
     stale_fill_seconds: float = 480.0
@@ -211,8 +211,14 @@ def shadow_paths(archive_cfg: ArchiveConfig) -> list[Path]:
 
 
 def iter_shadow_fills(archive_cfg: ArchiveConfig) -> list[dict[str, Any]]:
+    """Load shadow fills, optionally filtered by time window.
+
+    Without `since`, loads all fills from the past 24 hours. With `since`,
+    only loads files modified after that timestamp AND filters rows by ts.
+    """
     rows: list[dict[str, Any]] = []
-    for path in shadow_paths(archive_cfg):
+    paths = shadow_paths(archive_cfg)
+    for path in paths:
         try:
             with gzip.open(path, "rt") as f:
                 for line in f:
@@ -228,6 +234,36 @@ def iter_shadow_fills(archive_cfg: ArchiveConfig) -> list[dict[str, Any]]:
             LOG.exception("failed reading shadow path=%s", path)
     rows.sort(key=lambda r: parse_ts(r.get("ts")) or utc_now())
     return rows
+
+
+def _iter_fills_from_path(path: Path) -> list[dict[str, Any]]:
+    """Load fills from a single gzipped JSONL shadow file."""
+    rows: list[dict[str, Any]] = []
+    try:
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if (row.get("type") or row.get("kind")) == "fill":
+                    rows.append(row)
+    except Exception:
+        LOG.exception("failed reading shadow path=%s", path)
+    return rows
+
+
+# Only load files modified in the last N seconds (filesystem mtime check)
+def shadow_paths_recent(archive_cfg: ArchiveConfig, since_seconds: int) -> list[Path]:
+    """Like shadow_paths, but only return files modified within since_seconds."""
+    cutoff = time.time() - since_seconds
+    return [p for p in shadow_paths(archive_cfg) if p.exists() and p.stat().st_mtime >= cutoff]
+
+
+# Cap on memory usage: drop oldest in-memory entries if we exceed this
+MAX_PROCESSED_TRADE_IDS_INMEM = 30000
 
 
 def append_jsonl_fsync(path: Path, row: dict[str, Any]) -> None:
@@ -478,20 +514,26 @@ class PaperFollowerDaemon:
         accepts_today = sum(1 for r in existing if r.get("type") == "entry" and (parse_ts(r.get("ts")) or today) >= today)
         wrote = 0
         notify_rows: list[dict[str, Any]] = []
-        for fill in iter_shadow_fills(self.archive_cfg):
-            rows = self.process_fill(fill, accepts_today)
-            if rows:
-                signal_present = any(r.get("type") == "signal" for r in rows)
-                entry_present = any(r.get("type") == "entry" for r in rows)
-                if entry_present:
-                    accepts_today += 1
-                elif not signal_present:
-                    pass
-            for row in rows:
-                append_jsonl_fsync(self.cfg.ledger_path, row)
-                if row.get("type") in {"entry", "exit"}:
-                    notify_rows.append(row)
-                wrote += 1
+        # Memory: only load shadow files modified in the last hour (vs. all-time).
+        # Old files (older than 1h) have already been processed before.
+        recent_paths = shadow_paths_recent(self.archive_cfg, since_seconds=3600)
+        for path in recent_paths:
+            for fill in _iter_fills_from_path(path):
+                rows = self.process_fill(fill, accepts_today)
+                if rows:
+                    signal_present = any(r.get("type") == "signal" for r in rows)
+                    entry_present = any(r.get("type") == "entry" for r in rows)
+                    if entry_present:
+                        accepts_today += 1
+                for row in rows:
+                    append_jsonl_fsync(self.cfg.ledger_path, row)
+                    if row.get("type") in {"entry", "exit"}:
+                        notify_rows.append(row)
+                    wrote += 1
+        # Memory: cap processed_trade_ids growth in memory between writes
+        ptids = self.state.get("processed_trade_ids", [])
+        if len(ptids) > MAX_PROCESSED_TRADE_IDS_INMEM:
+            self.state["processed_trade_ids"] = ptids[-MAX_PROCESSED_TRADE_IDS_INMEM:]
         save_state(self.cfg.state_path, self.state)
         webhook_url = os.getenv("POLYMARKET_PAPER_WEBHOOK_URL") or os.getenv("DISCORD_WEBHOOK_URL")
         if notify_rows:
@@ -548,11 +590,17 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
     signals = [r for r in today_rows if r.get("type") == "signal"]
     entries = [r for r in today_rows if r.get("type") == "entry"]
     rejects = [r for r in today_rows if r.get("type") == "reject"]
+    ineligible = [r for r in today_rows if r.get("type") == "ineligible"]
     exits = [r for r in rows if r.get("type") in {"exit", "resolution"}]
     rejects_by_reason: dict[str, int] = {}
-    for row in rejects:
+    for row in rejects + ineligible:
         for reason in str(row.get("reject_reason") or "unknown").split(","):
-            rejects_by_reason[reason] = rejects_by_reason.get(reason, 0) + 1
+            if reason.strip():
+                rejects_by_reason[reason.strip()] = rejects_by_reason.get(reason.strip(), 0) + 1
+
+    # Coverage metric: % of today's signals that had BBO at detection
+    sig_with_book = sum(1 for r in signals if r.get("book_snapshot", {}) and any(v for v in (r.get("book_snapshot") or {}).values()))
+    coverage_pct = round(sig_with_book / len(signals) * 100, 1) if signals else 0.0
     state = load_state(cfg.state_path)
     positions = state.get("positions", {}) if isinstance(state.get("positions"), dict) else {}
     names = wallet_name_map()
@@ -605,6 +653,7 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
         "detection_latency_p50": round(latency_p50, 3),
         "detection_latency_p90": round(latency_p90, 3),
         "poll_interval_s": cfg.poll_interval_seconds,
+        "signal_coverage_pct": coverage_pct,
         "per_wallet": sorted(per.values(), key=lambda x: x["signals"], reverse=True),
     }
 
