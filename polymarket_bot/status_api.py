@@ -15,7 +15,8 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .archive_config import ArchiveConfig
-from .paper_follower import paper_status
+from .clob import best_bid_ask
+from .paper_follower import PaperConfig, paper_status, load_state
 
 app = FastAPI(title="Polymarket Copybot Status API", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(
@@ -392,6 +393,8 @@ STATE = RollingState()
 # every ~60s by the discord monitor, so refresh at most every PAPER_CACHE_TTL.
 _PAPER_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
 PAPER_CACHE_TTL = 5.0
+_POS_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
+POSITIONS_CACHE_TTL = 5.0
 
 
 def dashboard_response() -> FileResponse:
@@ -427,6 +430,76 @@ def get_paper() -> dict[str, Any]:
         _PAPER_CACHE["data"] = paper_status()
         _PAPER_CACHE["ts"] = now_ts
     return _PAPER_CACHE["data"]
+
+
+@app.get("/api/positions")
+def get_positions() -> dict[str, Any]:
+    """List all open paper positions with current mark-to-market PnL.
+
+    For each open position, fetches a fresh top-of-book from CLOB REST to
+    compute unrealized PnL. Cached for 5s to avoid hammering the API.
+    """
+    now_ts = time.time()
+    if now_ts - _POS_CACHE["ts"] < POSITIONS_CACHE_TTL:
+        return _POS_CACHE["data"]
+
+    cfg = PaperConfig.load()
+    state = load_state(cfg.state_path)
+    raw_positions = state.get("positions", {}) if isinstance(state.get("positions"), dict) else {}
+    out_positions: list[dict[str, Any]] = []
+    total_unrealized = 0.0
+    total_cost = 0.0
+    for pos_id, pos in raw_positions.items():
+        if not isinstance(pos, dict):
+            continue
+        token = pos.get("token", "")
+        wallet = pos.get("wallet", "")
+        cost_usd = float(pos.get("cost_usd") or 0)
+        shares = float(pos.get("shares") or 0)
+        entry_price = float(pos.get("entry_price") or 0)
+        opened_at = pos.get("opened_at", "")
+        # Live mark via REST — use bid for long (mark to liquidation value)
+        try:
+            book = best_bid_ask(token)
+            # Prefer bid (mark-to-close value for a long); fall back to ask only if no bid
+            bid = book.get("best_bid")
+            ask = book.get("best_ask")
+            if bid and float(bid) > 0:
+                cur_price = float(bid)
+            elif ask and float(ask) > 0:
+                cur_price = float(ask)
+            else:
+                cur_price = 0.0
+        except Exception:
+            cur_price = 0.0
+        market_value = shares * cur_price if cur_price else 0.0
+        unrealized = market_value - cost_usd
+        total_unrealized += unrealized
+        total_cost += cost_usd
+        out_positions.append({
+            "position_id": pos_id,
+            "wallet": wallet,
+            "token": token,
+            "cost_usd": round(cost_usd, 4),
+            "shares": round(shares, 4),
+            "entry_price": round(entry_price, 4),
+            "current_price": round(cur_price, 4),
+            "market_value": round(market_value, 4),
+            "unrealized_pnl": round(unrealized, 4),
+            "unrealized_pct": round((unrealized / cost_usd * 100) if cost_usd else 0, 2),
+            "opened_at": opened_at,
+        })
+    out_positions.sort(key=lambda p: p["opened_at"], reverse=True)
+    payload = {
+        "generated_at": iso_now(),
+        "count": len(out_positions),
+        "total_cost": round(total_cost, 4),
+        "total_unrealized": round(total_unrealized, 4),
+        "positions": out_positions,
+    }
+    _POS_CACHE["data"] = payload
+    _POS_CACHE["ts"] = now_ts
+    return payload
 
 
 def main() -> None:
