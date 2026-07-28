@@ -582,6 +582,21 @@ def get_pnl_timeseries(days: int = 30) -> dict[str, Any]:
     return payload
 
 
+@app.get("/api/wallets/quality")
+def get_wallets_quality() -> dict[str, Any]:
+    """Per-wallet quality scoring: PnL, win rate, holding period, active.
+
+    Cached 60s. Sorted by quality_score desc.
+    """
+    from .wallet_quality import compute_wallet_quality
+    wallets = compute_wallet_quality()
+    return {
+        "generated_at": iso_now(),
+        "count": len(wallets),
+        "wallets": wallets,
+    }
+
+
 @app.get("/api/digest")
 def get_digest() -> dict[str, Any]:
     """Build the same digest the daily timer would post to Discord.
