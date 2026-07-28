@@ -1,0 +1,13 @@
+[Unit]
+Description=Polybot runs/ cleanup — daily disk maintenance
+Documentation=https://github.com/luphillip041-hub/polybot
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/root/flip/projects/polymarket-copybot/.venv/bin/python -m polymarket_bot.cleanup
+WorkingDirectory=/root/flip/projects/polymarket-copybot
+Environment=PYTHONPATH=/root/flip/projects/polymarket-copybot
+StandardOutput=journal
+StandardError=journal

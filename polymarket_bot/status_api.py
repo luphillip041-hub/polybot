@@ -395,6 +395,8 @@ _PAPER_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
 PAPER_CACHE_TTL = 5.0
 _POS_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
 POSITIONS_CACHE_TTL = 5.0
+_DISK_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
+DISK_CACHE_TTL = 30.0
 
 
 def dashboard_response() -> FileResponse:
@@ -499,6 +501,64 @@ def get_positions() -> dict[str, Any]:
     }
     _POS_CACHE["data"] = payload
     _POS_CACHE["ts"] = now_ts
+    return payload
+
+
+@app.get("/api/disk")
+def get_disk() -> dict[str, Any]:
+    """runs/ directory size, file counts by age, oldest/newest file.
+
+    Cheap to compute. Cached 30s.
+    """
+    now_ts = time.time()
+    if now_ts - _DISK_CACHE["ts"] < DISK_CACHE_TTL:
+        return _DISK_CACHE["data"]
+    runs_dir = ROOT / "runs"
+    total_bytes = 0
+    file_count = 0
+    by_age: dict[str, int] = {"<1d": 0, "1-7d": 0, "7-30d": 0, ">30d": 0}
+    by_age_bytes: dict[str, int] = {"<1d": 0, "1-7d": 0, "7-30d": 0, ">30d": 0}
+    oldest: dict[str, Any] = {"path": "", "mtime": 0, "size": 0}
+    newest: dict[str, Any] = {"path": "", "mtime": 0, "size": 0}
+    for path in runs_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except (FileNotFoundError, OSError):
+            continue
+        file_count += 1
+        size = stat.st_size
+        total_bytes += size
+        age_days = (now_ts - stat.st_mtime) / 86400.0
+        if age_days < 1:
+            bucket = "<1d"
+        elif age_days < 7:
+            bucket = "1-7d"
+        elif age_days < 30:
+            bucket = "7-30d"
+        else:
+            bucket = ">30d"
+        by_age[bucket] += 1
+        by_age_bytes[bucket] += size
+        if not oldest["path"] or stat.st_mtime < oldest["mtime"]:
+            oldest = {"path": str(path), "mtime": stat.st_mtime, "size": size}
+        if stat.st_mtime > newest["mtime"]:
+            newest = {"path": str(path), "mtime": stat.st_mtime, "size": size}
+    payload = {
+        "generated_at": iso_now(),
+        "runs_dir": str(runs_dir),
+        "total_bytes": total_bytes,
+        "total_mb": round(total_bytes / 1e6, 2),
+        "file_count": file_count,
+        "by_age": {k: {"count": by_age[k], "bytes": by_age_bytes[k],
+                       "mb": round(by_age_bytes[k] / 1e6, 2)} for k in by_age},
+        "oldest_file": oldest,
+        "newest_file": newest,
+        "threshold_mb": 2000,  # cleanup hard cap default
+    }
+    _DISK_CACHE["data"] = payload
+    _DISK_CACHE["ts"] = now_ts
     return payload
 
 
