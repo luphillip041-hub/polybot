@@ -1,0 +1,12 @@
+[Unit]
+Description=Polybot weekly report — fetches status, posts to Discord
+Documentation=https://github.com/nousresearch/polybot
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/root/flip/projects/polymarket-copybot/.venv/bin/python -m polymarket_bot.weekly_report
+WorkingDirectory=/root/flip/projects/polymarket-copybot
+Environment=PYTHONPATH=/root/flip/projects/polymarket-copybot
+StandardOutput=journal
+StandardError=journal

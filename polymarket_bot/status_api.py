@@ -562,6 +562,84 @@ def get_disk() -> dict[str, Any]:
     return payload
 
 
+@app.get("/api/pnl/timeseries")
+def get_pnl_timeseries(days: int = 30) -> dict[str, Any]:
+    """Daily PnL time series for sparkline charts.
+
+    Cached 60s. Returns:
+      - daily: [{date, daily_pnl, cumulative_pnl}, ...]
+      - per_wallet: {wallets: [...], series: {name: {total, points: [...]}}}
+    """
+    from .timeseries import compute_daily_pnl, compute_per_wallet_daily
+    daily = compute_daily_pnl(days=days)
+    per_wallet = compute_per_wallet_daily(days=days, top_n=5)
+    payload = {
+        "generated_at": iso_now(),
+        "days": days,
+        "daily": daily,
+        "per_wallet": per_wallet,
+    }
+    return payload
+
+
+@app.get("/api/digest")
+def get_digest() -> dict[str, Any]:
+    """Build the same digest the daily timer would post to Discord.
+
+    Inlines the build so the polybot service doesn't need to import
+    the optsig digest module. If the dashboard is unreachable, returns
+    a minimal message from local data.
+
+    Cached 60s.
+    """
+    import json as _json
+    import urllib.request
+    from datetime import datetime, UTC
+    dashboard_url = os.environ.get("DASHBOARD_URL", "http://localhost:8730")
+    try:
+        req = urllib.request.Request(f"{dashboard_url}/api/bots")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = _json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return {"error": f"could not reach dashboard: {e}", "generated_at": iso_now()}
+
+    # Inline digest builder (matches optsig/digest.py)
+    poly = payload.get("polybot") or {}
+    optsig = payload.get("optsig") or {}
+    optsig_signals = payload.get("optsig_signals") or []
+    errs = payload.get("errors") or {}
+    ts = datetime.now(UTC).isoformat(timespec="seconds")
+    lines = [f"📈 **Daily Trading Digest** — `{ts}`", "", "**🪙 Polybot (Polymarket)**"]
+    if poly:
+        pnl = poly.get("realized_pnl", 0)
+        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        rate = (poly["accepts_today"] / poly["signals_today"] * 100) if poly.get("signals_today") else 0
+        lines.append(f"  • PnL: {pnl_emoji} ${pnl:+,.0f}")
+        lines.append(f"  • Account: ${poly.get('account_value', 0):,.0f}")
+        lines.append(f"  • Today: {poly.get('accepts_today', 0)}/{poly.get('signals_today', 0)} signals ({rate:.1f}%)")
+    else:
+        lines.append("  • _unreachable_")
+    lines.append("")
+    lines.append("**📊 Optsig (Options)**")
+    if optsig:
+        o_last = optsig.get("last_heartbeat") or {}
+        lines.append(f"  • Signals total: {optsig.get('signals_total', 0)}")
+        lines.append(f"  • Cycles: {optsig.get('cycles_total', 0)}")
+        lines.append(f"  • Last cycle: `{o_last.get('cycle_ts', '?')[:19]}`")
+    if optsig_signals:
+        lines.append("")
+        lines.append(f"Recent signals ({len(optsig_signals)}):")
+        for s in optsig_signals[:5]:
+            lines.append(f"  • {s.get('ticker','')} ({s.get('producer','')}) {s.get('action','')} score={s.get('score',0):.0f}")
+    msg = "\n".join(lines)[:1900]
+    return {
+        "generated_at": iso_now(),
+        "message": msg,
+        "length": len(msg),
+        "dashboard_url": dashboard_url,
+    }
+
+
 def main() -> None:
     import uvicorn
 
@@ -572,3 +650,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

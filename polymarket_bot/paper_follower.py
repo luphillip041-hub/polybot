@@ -615,6 +615,36 @@ class PaperFollowerDaemon:
         return out
 
     def process_once(self) -> int:
+        # Auto-pause: kill switch file
+        if (Path("/root/flip/projects/polymarket-copybot/optsig-paper.disabled")).exists():
+            LOG.info("Paper trading paused (kill switch exists). Skipping cycle.")
+            return 0
+        # Auto-pause: daily loss cap
+        daily_cap_file = Path("/root/flip/projects/polymarket-copybot/runs/paper/.daily_cap")
+        if daily_cap_file.exists():
+            try:
+                cap = json.loads(daily_cap_file.read_text())
+                max_loss = float(cap.get("max_usd", 0))
+                # Compute today's PnL by scanning existing ledger
+                ledger_rows = read_jsonl(self.cfg.ledger_path)
+                today_start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+                pnl_today = 0.0
+                for r in ledger_rows:
+                    if r.get("type") not in ("exit", "resolution"):
+                        continue
+                    rt = parse_ts(r.get("ts"))
+                    if rt and rt >= today_start:
+                        try:
+                            pnl_today += float(r.get("pnl") or 0)
+                        except (ValueError, TypeError):
+                            pass
+                if pnl_today < -max_loss:
+                    LOG.warning("Daily loss cap hit (PnL today: $%.2f, cap: $%.2f). Auto-pausing.",
+                                pnl_today, max_loss)
+                    Path("/root/flip/projects/polymarket-copybot/optsig-paper.disabled").touch()
+                    return 0
+            except Exception as e:
+                LOG.debug("daily cap check failed: %s", e)
         today = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
         existing = read_jsonl(self.cfg.ledger_path)
         accepts_today = sum(1 for r in existing if r.get("type") == "entry" and (parse_ts(r.get("ts")) or today) >= today)
