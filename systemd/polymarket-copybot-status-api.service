@@ -15,6 +15,8 @@ Environment=POLYMARKET_STATUS_PORT=8710
 ExecStart=/usr/bin/python3 -m polymarket_bot.status_api
 Restart=always
 RestartSec=5
+MemoryHigh=384M
+MemoryMax=512M
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

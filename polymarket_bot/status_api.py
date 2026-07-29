@@ -131,7 +131,8 @@ def iter_gzip_jsonl(path: Path, offset: int = 0) -> Iterator[dict[str, Any]]:
         with path.open("rb") as raw:
             raw.seek(offset)
             with gzip.GzipFile(fileobj=raw, mode="rb") as gz:
-                for line in gz.read().decode("utf-8", "ignore").splitlines():
+                for raw_line in gz:
+                    line = raw_line.decode("utf-8", "ignore")
                     if not line.strip():
                         continue
                     try:
@@ -180,8 +181,15 @@ class RollingState:
     # Shadow rows are smaller; cap to 7d (used for fills_today, wallets 7d, tokens_7d)
     shadow_rows: list[dict[str, Any]] = field(default_factory=list)
     heartbeat: dict[str, Any] = field(default_factory=dict)
+    _refresh_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def refresh(self, force: bool = False) -> None:
+        # FastAPI runs sync endpoints in a threadpool; ensure only one archive
+        # scan can allocate/merge rows at a time.
+        with self._refresh_lock:
+            self._refresh_unlocked(force)
+
+    def _refresh_unlocked(self, force: bool = False) -> None:
         now = time.time()
         if not force and now - self.last_refresh < CACHE_TTL_SECONDS:
             return
@@ -194,8 +202,10 @@ class RollingState:
         if new_hour != self.current_hour_start:
             self.current_hour_start = new_hour
             self.book_count_hour = 0
-        # Keep enough rolling context for today + 7d wallets + max 14d gaps.
-        start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=14)
+        # Cold-start only the current/previous UTC day. Scanning the full
+        # multi-gigabyte retention set inside a request made /api/status an
+        # OOM/DoS surface. The daemon accumulates bounded history from here.
+        start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
         end = utc_now() + timedelta(days=1)
         for path in jsonl_paths("book", start, end):
             old_offset = self.offsets.get(str(path), 0)
@@ -216,6 +226,8 @@ class RollingState:
         for path in jsonl_paths("shadow", start, end):
             for row in iter_gzip_jsonl(path, self.offsets.get(str(path), 0)):
                 self.shadow_rows.append(row)
+                if len(self.shadow_rows) > 30_000:
+                    del self.shadow_rows[:10_000]
             if path.exists():
                 self.offsets[str(path)] = path.stat().st_size
         cutoff_14d = utc_now() - timedelta(days=14)
@@ -227,7 +239,8 @@ class RollingState:
         self.shadow_rows = [
             r for r in self.shadow_rows
             if (parse_ts(r.get("ts") or r.get("fill_timestamp")) or utc_now()) >= cutoff_7d
-        ]
+        ][-30_000:]
+        self.gap_rows = self.gap_rows[-10_000:]
 
     def status(self) -> dict[str, Any]:
         self.refresh()

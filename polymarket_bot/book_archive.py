@@ -879,6 +879,7 @@ class BookArchiveDaemon:
             self.stats.last_heartbeat_at = iso_now()
             report = {
                 "ts": self.stats.last_heartbeat_at,
+                "last_ws_message_ts": self.last_ws_message_ts,
                 "config": self.config.to_jsonable(),
                 "stats": self.stats.__dict__,
                 "disk_estimate": {

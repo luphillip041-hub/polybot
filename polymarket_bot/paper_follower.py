@@ -776,10 +776,13 @@ class PaperFollowerDaemon:
         wrote = 0
         notify_rows: list[dict[str, Any]] = []
         heartbeat = read_json(self.archive_cfg.archive_dir / "heartbeat_latest.json")
-        heartbeat_ts = parse_ts(heartbeat.get("ts")) if isinstance(heartbeat, dict) else None
+        heartbeat_ts = (
+            parse_ts(heartbeat.get("last_ws_message_ts"))
+            if isinstance(heartbeat, dict) else None
+        )
         self._cycle_ws_age_seconds = (
             max(0.0, (utc_now() - heartbeat_ts).total_seconds())
-            if heartbeat_ts else latest_ws_age_seconds(self.archive_cfg)
+            if heartbeat_ts else float("inf")
         )
         self._cycle_gap_intervals = recent_gap_intervals(self.archive_cfg)
         # Memory: only load shadow files modified in the last hour (vs. all-time).
