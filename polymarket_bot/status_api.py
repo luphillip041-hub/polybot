@@ -202,10 +202,10 @@ class RollingState:
         if new_hour != self.current_hour_start:
             self.current_hour_start = new_hour
             self.book_count_hour = 0
-        # Cold-start only the current/previous UTC day. Scanning the full
-        # multi-gigabyte retention set inside a request made /api/status an
-        # OOM/DoS surface. The daemon accumulates bounded history from here.
-        start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        # Cold-start only the current UTC day. Scanning the full multi-gigabyte
+        # retention set inside a request made /api/status an OOM/DoS surface.
+        # The daemon accumulates bounded history from here.
+        start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
         end = utc_now() + timedelta(days=1)
         for path in jsonl_paths("book", start, end):
             old_offset = self.offsets.get(str(path), 0)
