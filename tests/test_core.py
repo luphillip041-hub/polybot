@@ -21,6 +21,7 @@ from polymarket_bot.paper_follower import (
     read_jsonl,
     render_trade_webhook,
     simulate_fill,
+    simulate_fill_shares,
     resolution_exit_price,
     apply_resolution,
     run_resolution_cycle,
@@ -255,7 +256,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("stale_fill", rows[1]["reject_reason"])
             self.assertEqual(set(rows[1]["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
             status = paper_status(cfg)
-            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "accepts_by_latency", "rejects_today", "rejects_by_reason", "realized_pnl", "realized_pnl_today", "unrealized_pnl", "open_notional", "account_value", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet", "signal_coverage_pct"})
+            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "accepts_by_latency", "rejects_today", "rejects_by_reason", "realized_pnl", "realized_pnl_today", "unrealized_pnl", "open_notional", "account_value", "last_ledger_ts", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet", "signal_coverage_pct"})
             self.assertGreaterEqual(status["rejects_today"], 1)
     def test_paper_follower_entry_and_exit_rows_include_book_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
@@ -279,6 +280,21 @@ class CoreTests(unittest.TestCase):
             msg = render_trade_webhook(entry, {"account_value": 100, "open_notional": 100, "realized_pnl": 0})
             self.assertIn("PAPER BUY", msg)
             self.assertIn("Paper account value", msg)
+
+    def test_fixed_share_exit_realizes_price_move(self):
+        book = {"top3_bids": [{"price": 0.69, "size": 1000}]}
+        price, shares, err = simulate_fill_shares(book, "SELL", 200, 0.005)
+        self.assertIsNone(err)
+        self.assertAlmostEqual(price, 0.685)
+        self.assertAlmostEqual(shares, 200.0)
+        self.assertAlmostEqual(shares * price - 100.0, 37.0)
+
+    def test_fixed_share_exit_rejects_insufficient_depth(self):
+        book = {"top3_bids": [{"price": 0.50, "size": 10}]}
+        price, shares, err = simulate_fill_shares(book, "SELL", 20, 0)
+        self.assertIsNone(price)
+        self.assertEqual(shares, 0.0)
+        self.assertEqual(err, "insufficient_depth")
 
     def test_wallet_driven_token_added_on_unmatched_trade(self):
         with tempfile.TemporaryDirectory() as td:

@@ -271,6 +271,34 @@ def simulate_fill(book: dict[str, Any], side: str, stake_usd: float, haircut: fl
     return spent / shares, shares, None
 
 
+def simulate_fill_shares(
+    book: dict[str, Any], side: str, shares_to_fill: float, haircut: float = 0.005
+) -> tuple[float | None, float, str | None]:
+    """Walk book depth for a fixed quantity, used when closing a position."""
+    levels = book_levels(book, side)
+    if not levels:
+        return None, 0.0, "missing_book"
+    remaining = max(0.0, float(shares_to_fill))
+    if remaining <= 0:
+        return None, 0.0, "invalid_position_size"
+    filled = 0.0
+    proceeds = 0.0
+    for level in levels:
+        px = level["price"] + haircut if side == "BUY" else level["price"] - haircut
+        px = min(0.999, max(0.001, px))
+        use = min(remaining, level["size"])
+        if use <= 0:
+            continue
+        filled += use
+        proceeds += use * px
+        remaining -= use
+        if remaining <= 1e-9:
+            break
+    if remaining > 1e-6 or filled <= 0:
+        return None, 0.0, "insufficient_depth"
+    return proceeds / filled, filled, None
+
+
 def shadow_paths(archive_cfg: ArchiveConfig) -> list[Path]:
     start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
     end = utc_now() + timedelta(days=1)
@@ -320,6 +348,31 @@ def _iter_fills_from_path(path: Path) -> list[dict[str, Any]]:
     except Exception:
         LOG.exception("failed reading shadow path=%s", path)
     return rows
+
+
+def _iter_new_fills_from_path(path: Path, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+    """Read only complete gzip members appended after a compressed offset."""
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows, 0
+    size = path.stat().st_size
+    if offset < 0 or offset > size:
+        offset = 0
+    try:
+        with path.open("rb") as raw:
+            raw.seek(offset)
+            with gzip.GzipFile(fileobj=raw, mode="rb") as gz:
+                for raw_line in gz:
+                    try:
+                        row = json.loads(raw_line.decode("utf-8"))
+                    except Exception:
+                        continue
+                    if (row.get("type") or row.get("kind")) == "fill":
+                        rows.append(row)
+    except (EOFError, OSError):
+        # Retry the member next cycle if the writer is between append/close.
+        return [], offset
+    return rows, size
 
 
 # Only load files modified in the last N seconds (filesystem mtime check)
@@ -411,6 +464,41 @@ def detection_inside_gap(archive_cfg: ArchiveConfig, ts: datetime) -> bool:
     return False
 
 
+_RECENT_GAP_CACHE: dict[str, Any] = {"ts": 0.0, "intervals": []}
+RECENT_GAP_CACHE_TTL_SECONDS = 15.0
+
+
+def recent_gap_intervals(
+    archive_cfg: ArchiveConfig, *, minutes: int = 15
+) -> list[tuple[datetime, datetime]]:
+    """Load recent gap intervals once per follower cycle."""
+    if time.time() - float(_RECENT_GAP_CACHE["ts"]) < RECENT_GAP_CACHE_TTL_SECONDS:
+        return list(_RECENT_GAP_CACHE["intervals"])
+    now = utc_now()
+    start = now - timedelta(minutes=minutes)
+    end = now + timedelta(minutes=1)
+    intervals: list[tuple[datetime, datetime]] = []
+    for path in jsonl_paths("book", start, end, archive_cfg.archive_dir):
+        try:
+            with gzip.open(path, "rt") as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if row.get("type") != "gap":
+                        continue
+                    gap_start = parse_ts(row.get("start_ts"))
+                    gap_end = parse_ts(row.get("end_ts"))
+                    if gap_start and gap_end and gap_end >= start:
+                        intervals.append((gap_start, gap_end))
+        except Exception:
+            continue
+    _RECENT_GAP_CACHE["ts"] = time.time()
+    _RECENT_GAP_CACHE["intervals"] = intervals
+    return intervals
+
+
 def position_key(wallet: str, token: str) -> str:
     return f"{wallet.lower()}:{token}"
 
@@ -424,7 +512,15 @@ def market_resolution_soon(book: dict[str, Any], now: datetime) -> bool:
     return False
 
 
-def reject_reasons(row: dict[str, Any], cfg: PaperConfig, archive_cfg: ArchiveConfig, state: dict[str, Any]) -> list[str]:
+def reject_reasons(
+    row: dict[str, Any],
+    cfg: PaperConfig,
+    archive_cfg: ArchiveConfig,
+    state: dict[str, Any],
+    *,
+    ws_age_seconds: float | None = None,
+    inside_gap: bool | None = None,
+) -> list[str]:
     reasons: list[str] = []
     wallet = str(row.get("wallet") or "").lower()
     # REMOVED 2026-07-23 (per review): wallet_not_allowlisted rejection.
@@ -460,9 +556,11 @@ def reject_reasons(row: dict[str, Any], cfg: PaperConfig, archive_cfg: ArchiveCo
         reasons.append("illiquid_depth")
     if market_resolution_soon(book, detect_ts):
         reasons.append("near_resolution")
-    if latest_ws_age_seconds(archive_cfg) > cfg.max_ws_age_seconds:
+    ws_age = latest_ws_age_seconds(archive_cfg) if ws_age_seconds is None else ws_age_seconds
+    if ws_age > cfg.max_ws_age_seconds:
         reasons.append("blind_ws_stale")
-    if detection_inside_gap(archive_cfg, detect_ts):
+    gap_hit = detection_inside_gap(archive_cfg, detect_ts) if inside_gap is None else inside_gap
+    if gap_hit:
         reasons.append("blind_gap")
     token = str((row.get("trade") or {}).get("asset") or book.get("token_id") or "")
     if side == "BUY" and position_key(wallet, token) in state.get("positions", {}):
@@ -519,9 +617,32 @@ class PaperFollowerDaemon:
             # newly observed fills after service activation.
             self.state["processed_trade_ids"] = [str(r.get("trade_id") or trade_id(r.get("trade") or {})) for r in iter_shadow_fills(self.archive_cfg)]
             save_state(self.cfg.state_path, self.state)
+        self._processed_trade_ids = set(map(str, self.state.get("processed_trade_ids", [])))
+        self._shadow_offsets: dict[str, int] = {}
+        self._daily_key = ""
+        self._accepts_today = 0
+        self._pnl_today = 0.0
+        self._cycle_ws_age_seconds: float | None = None
+        self._cycle_gap_intervals: list[tuple[datetime, datetime]] = []
+        self._refresh_daily_counters(force=True)
         self.running = True
         self._last_resolution_at = time.time()
         self._resolution_summary: dict[str, Any] = {"last_checked_at": None, "checked": 0, "resolved": 0, "skipped": 0}
+
+    def _refresh_daily_counters(self, *, force: bool = False) -> None:
+        today = utc_now().strftime("%Y-%m-%d")
+        if not force and today == self._daily_key:
+            return
+        start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
+        rows = read_jsonl(self.cfg.ledger_path)
+        todays_rows = [r for r in rows if (parse_ts(r.get("ts")) or start) >= start]
+        self._daily_key = today
+        self._accepts_today = sum(1 for r in todays_rows if r.get("type") == "entry")
+        self._pnl_today = sum(
+            num(r.get("pnl"), 0)
+            for r in todays_rows
+            if r.get("type") in {"exit", "resolution"}
+        )
 
     def signal_row(self, row: dict[str, Any], tid: str, latency: float | None) -> dict[str, Any]:
         trade = row.get("trade") if isinstance(row.get("trade"), dict) else {}
@@ -548,7 +669,7 @@ class PaperFollowerDaemon:
     def process_fill(self, row: dict[str, Any], accepts_today: int) -> list[dict[str, Any]]:
         trade = row.get("trade") if isinstance(row.get("trade"), dict) else {}
         tid = str(row.get("trade_id") or trade_id(trade))
-        if tid in set(self.state.get("processed_trade_ids", [])):
+        if tid in self._processed_trade_ids:
             return []
         detect_ts = parse_ts(row.get("ts")) or utc_now()
         fill_ts = parse_ts(row.get("fill_timestamp") or trade.get("timestamp"))
@@ -569,7 +690,17 @@ class PaperFollowerDaemon:
             _token_for_archive = str(trade.get("asset") or book.get("token_id") or "")
             if _token_for_archive:
                 _flag_token_for_archive_fn(_token_for_archive)
-        reasons = reject_reasons(row, self.cfg, self.archive_cfg, self.state)
+        inside_gap = any(
+            start <= detect_ts <= end for start, end in self._cycle_gap_intervals
+        )
+        reasons = reject_reasons(
+            row,
+            self.cfg,
+            self.archive_cfg,
+            self.state,
+            ws_age_seconds=self._cycle_ws_age_seconds,
+            inside_gap=inside_gap,
+        )
         lottery = is_lottery_band(row)
         eligible_live = (len(reasons) == 0) and not lottery
         out[0]["eligible_live"] = eligible_live
@@ -586,18 +717,21 @@ class PaperFollowerDaemon:
             # and type='ineligible' so it's distinguishable from hard rejects. Row preserved in ledger.
             rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "ineligible", "reject_reason": "lottery_price_band", "book_snapshot": snap})
             out.append(rej)
-        elif accepts_today >= self.cfg.max_signals_per_day:
+        elif side != "SELL" and accepts_today >= self.cfg.max_signals_per_day:
             rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": "daily_entry_cap", "book_snapshot": snap})
             out.append(rej)
         elif side == "SELL":
             pos_id = position_key(wallet, token)
-            pos = self.state.get("positions", {}).pop(pos_id)
-            price, shares, fill_err = simulate_fill(book, "SELL", num(pos.get("cost_usd"), self.cfg.stake_usd), self.cfg.haircut)
+            pos = self.state.get("positions", {}).get(pos_id) or {}
+            price, shares, fill_err = simulate_fill_shares(
+                book, "SELL", num(pos.get("shares"), 0), self.cfg.haircut
+            )
             if fill_err:
                 ex = dict(out[0]); ex.update({"ts": iso_now(), "type": "reject", "reject_reason": fill_err, "position_id": pos_id, "book_snapshot": snap})
             else:
                 proceeds = shares * (price or 0)
                 pnl = proceeds - num(pos.get("cost_usd"), 0)
+                self.state.get("positions", {}).pop(pos_id, None)
                 ex = dict(out[0]); ex.update({"ts": iso_now(), "type": "exit", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "pnl": pnl, "book_snapshot": snap})
             out.append(ex)
         else:
@@ -612,9 +746,15 @@ class PaperFollowerDaemon:
                 out.append(ent)
         self.state.setdefault("processed_trade_ids", []).append(tid)
         self.state["processed_trade_ids"] = list(dict.fromkeys(self.state["processed_trade_ids"]))[-20000:]
+        self._processed_trade_ids.add(tid)
+        if len(self._processed_trade_ids) > MAX_PROCESSED_TRADE_IDS_INMEM:
+            self._processed_trade_ids = set(
+                self.state["processed_trade_ids"][-MAX_PROCESSED_TRADE_IDS_INMEM:]
+            )
         return out
 
     def process_once(self) -> int:
+        self._refresh_daily_counters()
         # Auto-pause: kill switch file
         if (Path("/root/flip/projects/polymarket-copybot/optsig-paper.disabled")).exists():
             LOG.info("Paper trading paused (kill switch exists). Skipping cycle.")
@@ -625,36 +765,32 @@ class PaperFollowerDaemon:
             try:
                 cap = json.loads(daily_cap_file.read_text())
                 max_loss = float(cap.get("max_usd", 0))
-                # Compute today's PnL by scanning existing ledger
-                ledger_rows = read_jsonl(self.cfg.ledger_path)
-                today_start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
-                pnl_today = 0.0
-                for r in ledger_rows:
-                    if r.get("type") not in ("exit", "resolution"):
-                        continue
-                    rt = parse_ts(r.get("ts"))
-                    if rt and rt >= today_start:
-                        try:
-                            pnl_today += float(r.get("pnl") or 0)
-                        except (ValueError, TypeError):
-                            pass
-                if pnl_today < -max_loss:
+                if self._pnl_today < -max_loss:
                     LOG.warning("Daily loss cap hit (PnL today: $%.2f, cap: $%.2f). Auto-pausing.",
-                                pnl_today, max_loss)
+                                self._pnl_today, max_loss)
                     Path("/root/flip/projects/polymarket-copybot/optsig-paper.disabled").touch()
                     return 0
             except Exception as e:
                 LOG.debug("daily cap check failed: %s", e)
-        today = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
-        existing = read_jsonl(self.cfg.ledger_path)
-        accepts_today = sum(1 for r in existing if r.get("type") == "entry" and (parse_ts(r.get("ts")) or today) >= today)
+        accepts_today = self._accepts_today
         wrote = 0
         notify_rows: list[dict[str, Any]] = []
+        heartbeat = read_json(self.archive_cfg.archive_dir / "heartbeat_latest.json")
+        heartbeat_ts = parse_ts(heartbeat.get("ts")) if isinstance(heartbeat, dict) else None
+        self._cycle_ws_age_seconds = (
+            max(0.0, (utc_now() - heartbeat_ts).total_seconds())
+            if heartbeat_ts else latest_ws_age_seconds(self.archive_cfg)
+        )
+        self._cycle_gap_intervals = recent_gap_intervals(self.archive_cfg)
         # Memory: only load shadow files modified in the last hour (vs. all-time).
         # Old files (older than 1h) have already been processed before.
         recent_paths = shadow_paths_recent(self.archive_cfg, since_seconds=3600)
         for path in recent_paths:
-            for fill in _iter_fills_from_path(path):
+            key = str(path)
+            fills, new_offset = _iter_new_fills_from_path(
+                path, self._shadow_offsets.get(key, 0)
+            )
+            for fill in fills:
                 rows = self.process_fill(fill, accepts_today)
                 if rows:
                     signal_present = any(r.get("type") == "signal" for r in rows)
@@ -665,7 +801,11 @@ class PaperFollowerDaemon:
                     append_jsonl_fsync(self.cfg.ledger_path, row)
                     if row.get("type") in {"entry", "exit"}:
                         notify_rows.append(row)
+                    if row.get("type") == "exit":
+                        self._pnl_today += num(row.get("pnl"), 0)
                     wrote += 1
+            self._shadow_offsets[key] = new_offset
+        self._accepts_today = accepts_today
         # Memory: cap processed_trade_ids growth in memory between writes
         ptids = self.state.get("processed_trade_ids", [])
         if len(ptids) > MAX_PROCESSED_TRADE_IDS_INMEM:
@@ -698,6 +838,8 @@ class PaperFollowerDaemon:
             LOG.exception("resolution cycle failed")
             return {"checked": 0, "resolved": 0, "skipped": 0, "last_checked_at": iso_now(), "error": True}
         self._resolution_summary = summary
+        for row in summary.get("exit_rows", []):
+            self._pnl_today += num(row.get("pnl"), 0)
         return summary
 
     def run(self) -> None:
@@ -773,6 +915,10 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
             entries_by_latency[">300s"] += 1
     # Realized PnL today (closes today) vs all-time
     realized_today = sum(num(r.get("pnl"), 0) for r in rows if r.get("type") in {"exit", "resolution"} and (parse_ts(r.get("ts")) or today) >= today)
+    last_ledger_ts = next(
+        (row.get("ts") for row in reversed(rows) if row.get("ts")),
+        None,
+    )
     return {
         "positions_open": len(positions),
         "signals_today": len(signals),
@@ -785,6 +931,7 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
         "unrealized_pnl": round(unrealized, 4),
         "open_notional": round(open_notional, 4),
         "account_value": round(account_value, 4),
+        "last_ledger_ts": last_ledger_ts,
         "avg_detection_latency_s": round(sum(latencies) / len(latencies), 3) if latencies else 0.0,
         "detection_latency_p50": round(latency_p50, 3),
         "detection_latency_p90": round(latency_p90, 3),
@@ -812,7 +959,7 @@ def resolution_exit_price(side: str | None, outcome_status: str | object) -> flo
       - We hold PRIMARY by construction (paper follower is long-only and the
         CLOB returns tokens ordered as [primary, secondary] where primary is
         the YES-equivalent).
-20    """
+    """
     status_upper = str(outcome_status or "").strip().upper()
     if status_upper in {"", "UNKNOWN", "NONE"}:
         return None

@@ -4,6 +4,7 @@ import gzip
 import json
 import os
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -392,11 +393,17 @@ STATE = RollingState()
 # Cache paper_status() — it loads the full ledger into memory. /api/paper is polled
 # every ~60s by the discord monitor, so refresh at most every PAPER_CACHE_TTL.
 _PAPER_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
-PAPER_CACHE_TTL = 5.0
+_PAPER_STATS_CACHE: dict[str, Any] = {"ts": 0.0, "ledger_mtime_ns": None, "data": {}}
+PAPER_STATS_CACHE_TTL = 60.0
+PAPER_CACHE_TTL = 15.0
 _POS_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
-POSITIONS_CACHE_TTL = 5.0
+POSITIONS_CACHE_TTL = 15.0
 _DISK_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
 DISK_CACHE_TTL = 30.0
+_PNL_CACHE: dict[str, Any] = {"ts": 0.0, "days": None, "data": {}}
+_WALLET_CACHE: dict[str, Any] = {"ts": 0.0, "data": {}}
+ANALYTICS_CACHE_TTL = 60.0
+_CACHE_LOCK = threading.RLock()
 
 
 def dashboard_response() -> FileResponse:
@@ -428,10 +435,37 @@ def get_gaps(days: int = Query(7, ge=1, le=14)) -> list[dict[str, Any]]:
 @app.get("/api/paper")
 def get_paper() -> dict[str, Any]:
     now_ts = time.time()
-    if now_ts - _PAPER_CACHE["ts"] > PAPER_CACHE_TTL:
-        _PAPER_CACHE["data"] = paper_status()
-        _PAPER_CACHE["ts"] = now_ts
-    return _PAPER_CACHE["data"]
+    with _CACHE_LOCK:
+        if now_ts - _PAPER_CACHE["ts"] > PAPER_CACHE_TTL:
+            cfg = PaperConfig.load()
+            try:
+                ledger_mtime_ns = cfg.ledger_path.stat().st_mtime_ns
+            except OSError:
+                ledger_mtime_ns = None
+            if (
+                not _PAPER_STATS_CACHE["data"]
+                or (
+                    ledger_mtime_ns != _PAPER_STATS_CACHE["ledger_mtime_ns"]
+                    and now_ts - _PAPER_STATS_CACHE["ts"] >= PAPER_STATS_CACHE_TTL
+                )
+            ):
+                _PAPER_STATS_CACHE["data"] = paper_status(cfg)
+                _PAPER_STATS_CACHE["ledger_mtime_ns"] = ledger_mtime_ns
+                _PAPER_STATS_CACHE["ts"] = now_ts
+            payload = dict(_PAPER_STATS_CACHE["data"])
+            marks = get_positions()
+            unrealized = float(marks.get("total_unrealized") or 0)
+            open_notional = float(marks.get("total_cost") or 0)
+            payload["unrealized_pnl"] = round(unrealized, 4)
+            payload["open_notional"] = round(open_notional, 4)
+            payload["account_value"] = round(
+                float(payload.get("realized_pnl") or 0) + open_notional + unrealized, 4
+            )
+            payload["marks_generated_at"] = marks.get("generated_at")
+            payload["positions_snapshot"] = marks
+            _PAPER_CACHE["data"] = payload
+            _PAPER_CACHE["ts"] = now_ts
+        return _PAPER_CACHE["data"]
 
 
 @app.get("/api/positions")
@@ -448,9 +482,15 @@ def get_positions() -> dict[str, Any]:
     cfg = PaperConfig.load()
     state = load_state(cfg.state_path)
     raw_positions = state.get("positions", {}) if isinstance(state.get("positions"), dict) else {}
+    previous_positions = {
+        str(row.get("position_id")): row
+        for row in (_POS_CACHE.get("data", {}).get("positions", []) or [])
+        if isinstance(row, dict)
+    }
     out_positions: list[dict[str, Any]] = []
     total_unrealized = 0.0
     total_cost = 0.0
+    stale_marks = 0
     for pos_id, pos in raw_positions.items():
         if not isinstance(pos, dict):
             continue
@@ -461,20 +501,22 @@ def get_positions() -> dict[str, Any]:
         entry_price = float(pos.get("entry_price") or 0)
         opened_at = pos.get("opened_at", "")
         # Live mark via REST — use bid for long (mark to liquidation value)
+        mark_status = "live"
         try:
             book = best_bid_ask(token)
-            # Prefer bid (mark-to-close value for a long); fall back to ask only if no bid
+            # A long can be liquidated only at the bid; the ask is not a valid mark.
             bid = book.get("best_bid")
-            ask = book.get("best_ask")
             if bid and float(bid) > 0:
                 cur_price = float(bid)
-            elif ask and float(ask) > 0:
-                cur_price = float(ask)
             else:
-                cur_price = 0.0
+                raise ValueError("no executable bid")
         except Exception:
-            cur_price = 0.0
-        market_value = shares * cur_price if cur_price else 0.0
+            previous = previous_positions.get(str(pos_id), {})
+            previous_price = float(previous.get("current_price") or 0)
+            cur_price = previous_price if previous_price > 0 else entry_price
+            mark_status = "stale" if previous_price > 0 else "entry_fallback"
+            stale_marks += 1
+        market_value = shares * cur_price
         unrealized = market_value - cost_usd
         total_unrealized += unrealized
         total_cost += cost_usd
@@ -486,6 +528,7 @@ def get_positions() -> dict[str, Any]:
             "shares": round(shares, 4),
             "entry_price": round(entry_price, 4),
             "current_price": round(cur_price, 4),
+            "mark_status": mark_status,
             "market_value": round(market_value, 4),
             "unrealized_pnl": round(unrealized, 4),
             "unrealized_pct": round((unrealized / cost_usd * 100) if cost_usd else 0, 2),
@@ -497,6 +540,7 @@ def get_positions() -> dict[str, Any]:
         "count": len(out_positions),
         "total_cost": round(total_cost, 4),
         "total_unrealized": round(total_unrealized, 4),
+        "stale_marks": stale_marks,
         "positions": out_positions,
     }
     _POS_CACHE["data"] = payload
@@ -570,6 +614,10 @@ def get_pnl_timeseries(days: int = 30) -> dict[str, Any]:
       - daily: [{date, daily_pnl, cumulative_pnl}, ...]
       - per_wallet: {wallets: [...], series: {name: {total, points: [...]}}}
     """
+    now_ts = time.time()
+    with _CACHE_LOCK:
+        if now_ts - _PNL_CACHE["ts"] < ANALYTICS_CACHE_TTL and _PNL_CACHE["days"] == days:
+            return _PNL_CACHE["data"]
     from .timeseries import compute_daily_pnl, compute_per_wallet_daily
     daily = compute_daily_pnl(days=days)
     per_wallet = compute_per_wallet_daily(days=days, top_n=5)
@@ -579,6 +627,8 @@ def get_pnl_timeseries(days: int = 30) -> dict[str, Any]:
         "daily": daily,
         "per_wallet": per_wallet,
     }
+    with _CACHE_LOCK:
+        _PNL_CACHE.update({"ts": now_ts, "days": days, "data": payload})
     return payload
 
 
@@ -588,13 +638,20 @@ def get_wallets_quality() -> dict[str, Any]:
 
     Cached 60s. Sorted by quality_score desc.
     """
+    now_ts = time.time()
+    with _CACHE_LOCK:
+        if now_ts - _WALLET_CACHE["ts"] < ANALYTICS_CACHE_TTL:
+            return _WALLET_CACHE["data"]
     from .wallet_quality import compute_wallet_quality
     wallets = compute_wallet_quality()
-    return {
+    payload = {
         "generated_at": iso_now(),
         "count": len(wallets),
         "wallets": wallets,
     }
+    with _CACHE_LOCK:
+        _WALLET_CACHE.update({"ts": now_ts, "data": payload})
+    return payload
 
 
 @app.get("/api/digest")
