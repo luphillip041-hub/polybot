@@ -135,11 +135,14 @@ class DiscordMonitorTests(unittest.TestCase):
             status(),
             [{"date": "2026-07-07", "coverage_pct": 98.5, "gaps": [{"reason": "ws_stale"}, {"reason": "unit"}]}],
             datetime(2026, 7, 8, 13, 0, tzinfo=UTC),
+            {"stale_marks": 2, "entry_fallback_marks": 3},
         )
         self.assertIn("Daily Digest", digest)
         self.assertIn("98.5%", digest)
         self.assertIn("ws_stale", digest)
         self.assertIn("0 fills 3d+", digest)
+        self.assertIn("stale `2`", digest)
+        self.assertIn("entry fallback `3`", digest)
 
 
 if __name__ == "__main__":

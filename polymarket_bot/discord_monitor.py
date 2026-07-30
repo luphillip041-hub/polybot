@@ -13,6 +13,7 @@ from discord import app_commands
 STATUS_URL = "http://127.0.0.1:8710/api/status"
 GAPS_URL = "http://127.0.0.1:8710/api/gaps?days=2"
 PAPER_URL = "http://127.0.0.1:8710/api/paper"
+POSITIONS_URL = "http://127.0.0.1:8710/api/positions"
 POLL_SECONDS = 60
 ALERT_COOLDOWN_SECONDS = 30 * 60
 UNREACHABLE_GRACE_SECONDS = 2 * 60
@@ -275,7 +276,12 @@ def render_gaps(status: dict[str, Any]) -> str:
     return "\n".join(lines)[:1900]
 
 
-def render_daily_digest(status: dict[str, Any], gaps_payload: list[dict[str, Any]] | None, now: datetime | None = None) -> str:
+def render_daily_digest(
+    status: dict[str, Any],
+    gaps_payload: list[dict[str, Any]] | None,
+    now: datetime | None = None,
+    positions_payload: dict[str, Any] | None = None,
+) -> str:
     now = now or utc_now()
     yesterday_key = (now.date() - timedelta(days=1)).isoformat()
     yesterday = next((row for row in gaps_payload or [] if row.get("date") == yesterday_key), {})
@@ -300,6 +306,7 @@ def render_daily_digest(status: dict[str, Any], gaps_payload: list[dict[str, Any
         lines.append(f"- `{row.get('name')}` today `{row.get('fills_today')}` 7d `{row.get('fills_7d')}` last `{age_label(row.get('last_fill_ts'), now)}` ago{flag}")
     lines += [
         "",
+        f"Position marks: stale `{int((positions_payload or {}).get('stale_marks') or 0)}` | entry fallback `{int((positions_payload or {}).get('entry_fallback_marks') or 0)}`",
         f"Followups: completed `{shadow.get('followups_completed_today')}` missed `{shadow.get('followups_missed_today')}` pending `{shadow.get('followups_pending')}`",
         f"Disk: `{archiver.get('mb_per_day')}` MB/day | retention `{archiver.get('retention_gb')}` GB / `{archiver.get('retention_days')}`d",
     ]
@@ -344,6 +351,9 @@ class CopybotMonitor(discord.Client):
     async def fetch_paper(self) -> dict[str, Any]:
         return await self.fetch_json(PAPER_URL)
 
+    async def fetch_positions(self) -> dict[str, Any]:
+        return await self.fetch_json(POSITIONS_URL)
+
     async def send_channel(self, content: str) -> None:
         channel = self.get_channel(self.channel_id) or await self.fetch_channel(self.channel_id)
         if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.DMChannel)):
@@ -368,7 +378,8 @@ class CopybotMonitor(discord.Client):
             return
         status = self.state.last_status or await self.fetch_status()
         gaps = await self.fetch_gaps()
-        await self.send_channel(render_daily_digest(status, gaps, now))
+        positions = await self.fetch_positions()
+        await self.send_channel(render_daily_digest(status, gaps, now, positions))
         self.state.last_digest_date = now.date()
 
     async def poll_loop(self) -> None:

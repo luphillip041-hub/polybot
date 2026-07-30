@@ -150,6 +150,7 @@ def test_positions_marks_many_positions_with_one_archive_lookup_and_no_rest(
         return {token: {"best_bid": 0.50, "best_ask": 0.51} for token in tokens}
 
     monkeypatch.setattr(status_api, "_latest_archived_books", fake_archive_lookup)
+    monkeypatch.setattr(status_api, "ARCHIVE_DIR", tmp_path)
     status_api._POS_CACHE.update({"ts": 0.0, "data": {}})
     payload = status_api.get_positions()
 
@@ -157,6 +158,62 @@ def test_positions_marks_many_positions_with_one_archive_lookup_and_no_rest(
     assert payload["stale_marks"] == 0
     assert len(calls) == 1
     assert len(calls[0]) == 200
+
+
+def test_position_mark_coverage_counts_fallback_separately_and_updates_heartbeat(
+    tmp_path: Path, monkeypatch
+):
+    from polymarket_bot import status_api
+    from polymarket_bot.paper_follower import PaperConfig
+
+    state_path = tmp_path / "state.json"
+    positions = {
+        f"wallet:{token}": {
+            "wallet": "wallet",
+            "token": token,
+            "entry_price": 0.40,
+            "shares": 10.0,
+            "cost_usd": 4.0,
+            "opened_at": "2026-07-30T12:00:00+00:00",
+        }
+        for token in ("live", "stale", "fallback")
+    }
+    state_path.write_text(json.dumps({"positions": positions, "processed_trade_ids": []}))
+    monkeypatch.setattr(
+        PaperConfig,
+        "load",
+        classmethod(lambda cls: PaperConfig(state_path=state_path)),
+    )
+    monkeypatch.setattr(status_api, "ARCHIVE_DIR", tmp_path)
+    monkeypatch.setattr(
+        status_api,
+        "_latest_archived_books",
+        lambda tokens, archive_dir=None: {"live": {"best_bid": 0.55, "best_ask": 0.56}},
+    )
+    (tmp_path / "heartbeat_latest.json").write_text(json.dumps({"ts": "before"}))
+    status_api._POS_CACHE.update(
+        {
+            "ts": 0.0,
+            "data": {
+                "positions": [
+                    {"position_id": "wallet:stale", "current_price": 0.50},
+                ]
+            },
+        }
+    )
+
+    payload = status_api.get_positions()
+
+    assert payload["count"] == 3
+    assert payload["stale_marks"] == 1
+    assert payload["entry_fallback_marks"] == 1
+    statuses = {row["token"]: row["mark_status"] for row in payload["positions"]}
+    assert statuses == {"live": "live", "stale": "stale", "fallback": "entry_fallback"}
+    heartbeat = json.loads((tmp_path / "heartbeat_latest.json").read_text())
+    assert heartbeat["stale_marks"] == 1
+    assert heartbeat["entry_fallback_marks"] == 1
+    assert heartbeat["mark_coverage"]["stale_marks"] == 1
+    assert heartbeat["mark_coverage"]["entry_fallback_marks"] == 1
 
 
 def test_live_resolution_uses_fractional_payout_and_preserves_binary_outcomes(monkeypatch):

@@ -536,6 +536,7 @@ def get_positions() -> dict[str, Any]:
     total_unrealized = 0.0
     total_cost = 0.0
     stale_marks = 0
+    entry_fallback_marks = 0
     archived_books = _latest_archived_books(
         {str(pos.get("token") or "") for pos in raw_positions.values() if isinstance(pos, dict)}
     )
@@ -563,7 +564,10 @@ def get_positions() -> dict[str, Any]:
             previous_price = float(previous.get("current_price") or 0)
             cur_price = previous_price if previous_price > 0 else entry_price
             mark_status = "stale" if previous_price > 0 else "entry_fallback"
-            stale_marks += 1
+            if mark_status == "stale":
+                stale_marks += 1
+            else:
+                entry_fallback_marks += 1
         market_value = shares * cur_price
         unrealized = market_value - cost_usd
         total_unrealized += unrealized
@@ -589,11 +593,42 @@ def get_positions() -> dict[str, Any]:
         "total_cost": round(total_cost, 4),
         "total_unrealized": round(total_unrealized, 4),
         "stale_marks": stale_marks,
+        "entry_fallback_marks": entry_fallback_marks,
         "positions": out_positions,
     }
+    _persist_mark_coverage(payload)
     _POS_CACHE["data"] = payload
     _POS_CACHE["ts"] = now_ts
     return payload
+
+
+def _persist_mark_coverage(payload: dict[str, Any]) -> None:
+    """Merge mark coverage into the archiver heartbeat without touching bot state."""
+    heartbeat_path = ARCHIVE_DIR / "heartbeat_latest.json"
+    if not heartbeat_path.exists():
+        return
+    try:
+        heartbeat = json.loads(heartbeat_path.read_text())
+        if not isinstance(heartbeat, dict):
+            heartbeat = {}
+        stale_marks = int(payload.get("stale_marks") or 0)
+        entry_fallback_marks = int(payload.get("entry_fallback_marks") or 0)
+        total = int(payload.get("count") or 0)
+        heartbeat["stale_marks"] = stale_marks
+        heartbeat["entry_fallback_marks"] = entry_fallback_marks
+        heartbeat["mark_coverage"] = {
+            "generated_at": payload.get("generated_at"),
+            "positions": total,
+            "live_marks": max(0, total - stale_marks - entry_fallback_marks),
+            "stale_marks": stale_marks,
+            "entry_fallback_marks": entry_fallback_marks,
+        }
+        tmp = heartbeat_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(heartbeat, indent=2, sort_keys=True))
+        tmp.replace(heartbeat_path)
+    except (OSError, ValueError, TypeError):
+        # Telemetry persistence must never make the read-only endpoint fail.
+        return
 
 
 @app.get("/api/disk")

@@ -21,6 +21,8 @@ class PositionsEndpointTest(unittest.TestCase):
 
         # Build a fake state with 2 positions
         self.tmpdir = tempfile.mkdtemp()
+        self._archive_dir_patch = patch.object(status_api, "ARCHIVE_DIR", Path(self.tmpdir))
+        self._archive_dir_patch.start()
         self.state_path = Path(self.tmpdir) / "state.json"
         state = {
             "processed_trade_ids": [],
@@ -73,6 +75,7 @@ class PositionsEndpointTest(unittest.TestCase):
     def tearDown(self):
         self._pc_patch.stop()
         self._clob_patch.stop()
+        self._archive_dir_patch.stop()
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 

@@ -896,7 +896,16 @@ class BookArchiveDaemon:
                 "pending_followups": len(self.followup_queue),
                 "archive_dir": str(self.config.archive_dir),
             }
-            write_json(self.config.archive_dir / "heartbeat_latest.json", report)
+            heartbeat_path = self.config.archive_dir / "heartbeat_latest.json"
+            try:
+                previous = json.loads(heartbeat_path.read_text()) if heartbeat_path.exists() else {}
+            except (OSError, ValueError, TypeError):
+                previous = {}
+            if isinstance(previous, dict):
+                for key in ("stale_marks", "entry_fallback_marks", "mark_coverage"):
+                    if key in previous:
+                        report[key] = previous[key]
+            write_json(heartbeat_path, report)
             LOG.info(
                 "heartbeat markets=%s tokens=%s book_rows=%s gaps=%s ws=%s wallet_seen=%s matched=%s shadow_rows=%s compressed_mb_day=%.3f retention_gb=%.3f",
                 self.stats.markets_covered, self.stats.tokens_covered, self.stats.book_rows_written, self.stats.gap_rows_written,
