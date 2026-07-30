@@ -295,6 +295,7 @@ class OnchainShadowConfig:
     allowlist_path: Path
     markets_path: Path
     archive_dir: Path
+    backfill_chunk_blocks: int = 50
 
     @classmethod
     def from_env(cls) -> "OnchainShadowConfig":
@@ -336,6 +337,9 @@ class OnchainShadowConfig:
             archive_dir=Path(
                 os.getenv("ONCHAIN_ARCHIVE_DIR", str(archive_dir))
             ),
+            backfill_chunk_blocks=int(
+                os.getenv("ONCHAIN_BACKFILL_CHUNK_BLOCKS", "50")
+            ),
         )
 
     def validate(self) -> None:
@@ -347,3 +351,5 @@ class OnchainShadowConfig:
             raise ValueError("ONCHAIN_CONFIRMATIONS must be at least 1")
         if self.max_backfill_blocks < self.initial_backfill_blocks:
             raise ValueError("max backfill must cover initial backfill")
+        if self.backfill_chunk_blocks < 1:
+            raise ValueError("backfill chunk size must be positive")

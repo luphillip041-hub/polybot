@@ -322,8 +322,12 @@ class OnchainShadowWorker:
         recovered = dropped_blocks == 0
         logs_replayed = 0
         try:
-            for chunk_start in range(start, latest + 1, 200):
-                chunk_end = min(latest, chunk_start + 199)
+            for chunk_start in range(
+                start, latest + 1, self.config.backfill_chunk_blocks
+            ):
+                chunk_end = min(
+                    latest, chunk_start + self.config.backfill_chunk_blocks - 1
+                )
                 rows = await asyncio.to_thread(self.rpc.logs, chunk_start, chunk_end)
                 for row in rows:
                     self.ingest_log(row, origin="initial_backfill" if initial else "gap_backfill")
