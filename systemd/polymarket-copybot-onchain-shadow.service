@@ -1,0 +1,32 @@
+# Polygon on-chain Stage One measurement lane only.
+# Reads public RPC, archive metadata, Data API shadow files, and paper allowlist.
+# Writes only runs/onchain_shadow; it cannot write paper ledger/state/allowlist.
+[Unit]
+Description=Polymarket Polygon On-chain Shadow Measurement
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/flip/projects/polymarket-copybot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=POLYGON_WSS_RPC_URL=wss://polygon-bor-rpc.publicnode.com
+Environment=POLYGON_HTTP_RPC_URL=https://polygon-bor-rpc.publicnode.com
+Environment=ONCHAIN_CONFIRMATIONS=6
+EnvironmentFile=-/etc/polymarket-copybot-onchain-shadow.env
+ExecStart=/root/flip/projects/polymarket-copybot/.venv/bin/python -m polymarket_bot.onchain_shadow_worker
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/flip/projects/polymarket-copybot/runs/onchain_shadow
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

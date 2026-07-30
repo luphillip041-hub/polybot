@@ -299,6 +299,7 @@ class OnchainShadowConfig:
     @classmethod
     def from_env(cls) -> "OnchainShadowConfig":
         paper_dir = CONFIG.runs_dir / "paper"
+        shadow_dir = CONFIG.runs_dir / "onchain_shadow"
         archive_dir = CONFIG.runs_dir / "book_archive"
         return cls(
             wss_rpc_url=os.getenv(
@@ -314,12 +315,14 @@ class OnchainShadowConfig:
             heartbeat_seconds=int(os.getenv("ONCHAIN_HEARTBEAT_SECONDS", "60")),
             api_tail_seconds=int(os.getenv("ONCHAIN_API_TAIL_SECONDS", "15")),
             output_path=Path(
-                os.getenv("ONCHAIN_SHADOW_LOG", str(paper_dir / "shadow_onchain.jsonl"))
+                os.getenv(
+                    "ONCHAIN_SHADOW_LOG", str(shadow_dir / "shadow_onchain.jsonl")
+                )
             ),
             heartbeat_path=Path(
                 os.getenv(
                     "ONCHAIN_SHADOW_HEARTBEAT",
-                    str(paper_dir / "shadow_onchain_heartbeat.json"),
+                    str(shadow_dir / "heartbeat.json"),
                 )
             ),
             allowlist_path=Path(

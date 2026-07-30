@@ -10,7 +10,7 @@ from polymarket_bot.onchain_measurement import coverage_report
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Report Stage One on-chain/data-API measurement results")
-    parser.add_argument("--log", type=Path, default=Path("runs/paper/shadow_onchain.jsonl"))
+    parser.add_argument("--log", type=Path, default=Path("runs/onchain_shadow/shadow_onchain.jsonl"))
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     report = coverage_report(args.log)

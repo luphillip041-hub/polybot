@@ -69,6 +69,10 @@ def test_coverage_report_uses_same_ground_truth_and_counts_axes(tmp_path: Path) 
         {"type": "cross_source_mismatch", "status": "no_exact_match"},
         {"type": "reorg_removed", "durable_trade_id": "gone"},
         {"type": "rpc_gap", "missing_blocks": 3, "recovered": True},
+        {"type": "rpc_connected", "ts": "2026-07-30T14:00:00+00:00", "downtime_seconds": 0},
+        {"type": "rpc_disconnected", "ts": "2026-07-30T14:10:00+00:00", "connected_seconds": 600},
+        {"type": "rpc_connected", "ts": "2026-07-30T14:10:05+00:00", "downtime_seconds": 5},
+        {"type": "duplicate_detection", "source": "data_api", "durable_trade_id": "both"},
     ]
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     report = coverage_report(path)
@@ -76,10 +80,17 @@ def test_coverage_report_uses_same_ground_truth_and_counts_axes(tmp_path: Path) 
     assert report["lanes"]["polygon_onchain"]["p50_latency_seconds"] == 5.5
     assert report["lanes"]["data_api"]["p50_latency_seconds"] == 65.0
     assert report["first_seen"] == {"polygon_onchain": 1, "data_api": 0, "tie": 0}
-    assert report["duplicates"]["polygon_onchain"] == 1
+    assert report["duplicates"] == {"polygon_onchain": 1, "data_api": 1}
     assert report["cross_source_mismatches"] == 1
     assert report["reorg_events"] == 1
     assert report["rpc_gaps"] == {"events": 1, "missing_blocks": 3, "recovered_events": 1}
+    assert report["rpc_uptime"] == {
+        "connections": 2,
+        "disconnects": 1,
+        "connected_seconds_reported": 600.0,
+        "downtime_seconds_reported": 5.0,
+        "uptime_percent_reported": 99.17355371900827,
+    }
 
 
 def test_percentile_is_linear_and_empty_safe() -> None:

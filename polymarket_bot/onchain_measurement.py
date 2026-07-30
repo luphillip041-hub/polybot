@@ -307,6 +307,9 @@ def coverage_report(path: Path) -> dict[str, Any]:
     mismatch_count = 0
     reorg_count = 0
     gap_events = gap_blocks = recovered_gaps = 0
+    duplicate_events: Counter[str] = Counter()
+    rpc_connections = rpc_disconnects = 0
+    connected_seconds = downtime_seconds = 0.0
     started_at: str | None = None
     ended_at: str | None = None
     if path.exists():
@@ -335,6 +338,14 @@ def coverage_report(path: Path) -> dict[str, Any]:
                     gap_events += 1
                     gap_blocks += int(row.get("missing_blocks") or 0)
                     recovered_gaps += int(bool(row.get("recovered")))
+                elif row_type == "duplicate_detection":
+                    duplicate_events[str(row.get("source") or "unknown")] += 1
+                elif row_type == "rpc_connected":
+                    rpc_connections += 1
+                    downtime_seconds += float(row.get("downtime_seconds") or 0)
+                elif row_type == "rpc_disconnected":
+                    rpc_disconnects += 1
+                    connected_seconds += float(row.get("connected_seconds") or 0)
 
     sources = ("polygon_onchain", "data_api")
     coverage = {"seen_by_both": 0, "onchain_only": 0, "data_api_only": 0}
@@ -377,6 +388,7 @@ def coverage_report(path: Path) -> dict[str, Any]:
     lane_report: dict[str, dict[str, Any]] = {}
     total = len(detections)
     for source in sources:
+        duplicates[source] += duplicate_events[source]
         event_count = sum(bool(rows.get(source)) for rows in detections.values())
         lane_report[source] = {
             "event_count": event_count,
@@ -403,6 +415,17 @@ def coverage_report(path: Path) -> dict[str, Any]:
             "events": gap_events,
             "missing_blocks": gap_blocks,
             "recovered_events": recovered_gaps,
+        },
+        "rpc_uptime": {
+            "connections": rpc_connections,
+            "disconnects": rpc_disconnects,
+            "connected_seconds_reported": connected_seconds,
+            "downtime_seconds_reported": downtime_seconds,
+            "uptime_percent_reported": (
+                100.0 * connected_seconds / (connected_seconds + downtime_seconds)
+                if connected_seconds + downtime_seconds > 0
+                else None
+            ),
         },
         "row_types": dict(type_counts),
     }
