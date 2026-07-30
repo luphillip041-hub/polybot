@@ -425,6 +425,12 @@ def dashboard_response() -> FileResponse:
     return FileResponse(DASHBOARD_FILE, media_type="text/html")
 
 
+@app.get("/healthz", include_in_schema=False)
+def healthz() -> dict[str, Any]:
+    """Cheap process-liveness probe; intentionally independent of bot state."""
+    return {"ok": True, "service": "polymarket-copybot-status-api"}
+
+
 @app.get("/", include_in_schema=False)
 def get_root() -> FileResponse:
     return dashboard_response()
