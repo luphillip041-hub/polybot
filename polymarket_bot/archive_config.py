@@ -59,7 +59,7 @@ class ArchiveConfig:
 
     # Paper follower
     paper_dir: Path = Path(_env_str("PAPER_DIR", str(CONFIG.runs_dir / "paper")))
-    stale_fill_seconds: int = _env_int("STALE_FILL_SECONDS", 480)
+    stale_fill_seconds: int = _env_int("STALE_FILL_SECONDS", 120)
     paper_poll_interval_seconds: int = _env_int("PAPER_POLL_INTERVAL_SEC", 3)
 
     @classmethod

@@ -75,7 +75,7 @@ class BotConfig:
 
         # Paper trading
         self.paper_order_size_usd: float = kwargs.get("paper_order_size_usd", env_float("PAPER_ORDER_SIZE_USD", 25.0))
-        self.stale_fill_seconds: int = kwargs.get("stale_fill_seconds", env_int("STALE_FILL_SECONDS", 480))
+        self.stale_fill_seconds: int = kwargs.get("stale_fill_seconds", env_int("STALE_FILL_SECONDS", 120))
         self.max_open_positions: int = kwargs.get("max_open_positions", env_int("MAX_OPEN_POSITIONS", 150))
         self.paper_poll_interval_seconds: int = kwargs.get("paper_poll_interval_seconds", env_int("PAPER_POLL_INTERVAL_SEC", 3))
 

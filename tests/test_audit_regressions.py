@@ -249,3 +249,54 @@ def test_wallet_quality_averages_only_matched_holds_and_applies_one_pnl_tier(tmp
     assert result["avg_holding_hours"] == 3.0
     assert result["realized_pnl"] == 80.0
     assert result["quality_score"] == 30.0  # +20 PnL tier, +10 short matched hold
+
+
+def test_default_stale_fill_rejects_200_seconds_and_records_latency(tmp_path: Path, monkeypatch):
+    from polymarket_bot.archive_config import ArchiveConfig
+    from polymarket_bot.paper_follower import PaperConfig, PaperFollowerDaemon
+
+    monkeypatch.delenv("STALE_FILL_SECONDS", raising=False)
+    paper = tmp_path / "paper"
+    archive = tmp_path / "archive"
+    paper.mkdir()
+    archive.mkdir()
+    cfg = PaperConfig(
+        paper_dir=paper,
+        ledger_path=paper / "ledger.jsonl",
+        state_path=paper / "state.json",
+        allowlist_path=paper / "allowlist.json",
+        data_quality_path=paper / "data_quality.json",
+    )
+    assert cfg.stale_fill_seconds == 120
+    monkeypatch.setenv("STALE_FILL_SECONDS", "240")
+    assert PaperConfig().stale_fill_seconds == 240
+    monkeypatch.delenv("STALE_FILL_SECONDS")
+    acfg = ArchiveConfig(
+        archive_dir=archive,
+        state_path=tmp_path / "shadow.json",
+        followup_queue_path=archive / "followups.json",
+    )
+    daemon = PaperFollowerDaemon(cfg, acfg)
+    daemon._cycle_ws_age_seconds = 0
+    row = {
+        "ts": "2026-07-30T12:03:20+00:00",
+        "fill_timestamp": "2026-07-30T12:00:00+00:00",
+        "wallet": "wallet",
+        "trade_id": "stale-200",
+        "fill_side": "BUY",
+        "fill_price": 0.50,
+        "trade": {"asset": "token", "side": "BUY", "price": 0.50},
+        "book_at_detection": {
+            "token_id": "token",
+            "best_bid": 0.49,
+            "best_ask": 0.50,
+            "spread": 0.01,
+            "top3_asks": [{"price": 0.50, "size": 1000}],
+        },
+    }
+
+    output = daemon.process_fill(row, accepts_today=0)
+
+    assert output[1]["type"] == "reject"
+    assert "stale_fill" in output[1]["reject_reason"]
+    assert output[1]["detection_latency_s"] == 200.0

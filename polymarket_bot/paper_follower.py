@@ -34,7 +34,9 @@ class PaperConfig:
     max_open_positions: int = int(os.getenv("PAPER_MAX_OPEN_POSITIONS", "150"))
     max_spread: float = 0.04
     min_top3_liquidity_multiple: float = 2.0
-    stale_fill_seconds: float = 480.0
+    stale_fill_seconds: float = field(
+        default_factory=lambda: float(os.getenv("STALE_FILL_SECONDS", "120"))
+    )
     max_ws_age_seconds: float = 60.0
     haircut: float = 0.005
     poll_interval_seconds: float = 3.0
