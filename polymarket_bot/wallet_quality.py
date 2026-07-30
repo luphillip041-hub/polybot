@@ -9,7 +9,7 @@ Computes from runs/paper/ledger.jsonl:
   - current open position count
 
 Scoring rubric (0-100):
-  +30 if PnL > 0
+  +30 if PnL > $1,000, otherwise +20 if PnL > 0
   +25 if win rate >= 50%
   +20 if total PnL > 5x their average trade size
   +15 if active in last 7 days
@@ -81,6 +81,7 @@ class WalletStats:
     signals: int = 0
     accepts: int = 0
     exits: int = 0
+    exits_with_holding: int = 0
     wins: int = 0  # exits with pnl > 0
     realized_pnl: float = 0.0
     total_cost: float = 0.0
@@ -96,6 +97,7 @@ class WalletStats:
             "signals": self.signals,
             "accepts": self.accepts,
             "exits": self.exits,
+            "exits_with_holding": self.exits_with_holding,
             "wins": self.wins,
             "win_rate": round(self.wins / self.exits * 100, 1) if self.exits else 0.0,
             "realized_pnl": round(self.realized_pnl, 2),
@@ -177,8 +179,9 @@ def compute_wallet_quality(
                         entry_ts = open_entries.pop((wallet, token), None)
                         if entry_ts and ts:
                             holding = (ts - entry_ts).total_seconds() / 3600
-                            # Running avg
-                            n = s.exits
+                            s.exits_with_holding += 1
+                            # Running average over matched entry/exit pairs only.
+                            n = s.exits_with_holding
                             s.avg_holding_hours = (s.avg_holding_hours * (n - 1) + holding) / n
     except Exception as e:
         logger.exception("ledger read error: %s", e)
@@ -197,11 +200,11 @@ def compute_wallet_quality(
     # Compute quality scores
     for s in stats_map.values():
         score = 0.0
-        # +30 PnL positive
-        if s.realized_pnl > 0:
+        # Tiered PnL contribution: award exactly one tier.
+        if s.realized_pnl > 1000:
             score += 30
-        elif s.realized_pnl > 1000:
-            score += 25
+        elif s.realized_pnl > 0:
+            score += 20
         # +25 win rate >= 50%
         if s.exits > 0:
             wr = s.wins / s.exits

@@ -221,3 +221,31 @@ def test_wallet_quality_default_paths_follow_configured_runs_dir(tmp_path: Path,
 
     assert result[0]["wallet"] == wallet
     assert result[0]["name"] == "Configured Wallet"
+
+
+def test_wallet_quality_averages_only_matched_holds_and_applies_one_pnl_tier(tmp_path: Path):
+    from polymarket_bot import wallet_quality
+
+    ledger = tmp_path / "ledger.jsonl"
+    wallet = "0xquality"
+    rows = [
+        {"type": "entry", "wallet": wallet, "token": "t1", "ts": "2026-07-01T00:00:00+00:00", "sim_fill_price": 0.5, "sim_size": 100},
+        {"type": "entry", "wallet": wallet, "token": "t2", "ts": "2026-07-01T00:00:00+00:00", "sim_fill_price": 0.5, "sim_size": 100},
+        {"type": "resolution", "wallet": wallet, "token": "t1", "ts": "2026-07-01T02:00:00+00:00", "pnl": 100},
+        {"type": "resolution", "wallet": wallet, "token": "t2", "ts": "2026-07-01T04:00:00+00:00", "pnl": -10},
+        {"type": "resolution", "wallet": wallet, "token": "stray", "ts": "2026-07-01T06:00:00+00:00", "pnl": -10},
+    ]
+    ledger.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    wallet_quality.clear_cache()
+
+    result = wallet_quality.compute_wallet_quality(
+        ledger_path=ledger,
+        state_path=tmp_path / "missing-state.json",
+        scores_path=tmp_path / "missing-scores.json",
+    )[0]
+
+    assert result["exits"] == 3
+    assert result["exits_with_holding"] == 2
+    assert result["avg_holding_hours"] == 3.0
+    assert result["realized_pnl"] == 80.0
+    assert result["quality_score"] == 30.0  # +20 PnL tier, +10 short matched hold
