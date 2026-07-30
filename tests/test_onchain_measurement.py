@@ -78,6 +78,18 @@ def test_coverage_report_uses_same_ground_truth_and_counts_axes(tmp_path: Path) 
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     report = coverage_report(path)
     assert report["coverage"] == {"seen_by_both": 1, "onchain_only": 1, "data_api_only": 1}
+    assert report["coverage_mature"] == {
+        "seen_by_both": 1,
+        "onchain_only": 1,
+        "data_api_only": 1,
+        "grace_seconds": 900.0,
+        "total_mature_events": 3,
+    }
+    assert report["metadata_resolution"] == {
+        "resolved": 0,
+        "unresolved": 2,
+        "resolved_percent": 0.0,
+    }
     assert report["lanes"]["polygon_onchain"]["p50_latency_seconds"] == 5.5
     assert report["lanes"]["data_api"]["p50_latency_seconds"] == 65.0
     assert report["first_seen"] == {"polygon_onchain": 1, "data_api": 0, "tie": 0}

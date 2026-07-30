@@ -324,7 +324,13 @@ def lane_detection_row(
     return row
 
 
-def coverage_report(path: Path) -> dict[str, Any]:
+def coverage_report(
+    path: Path,
+    *,
+    as_of_epoch: float | None = None,
+    miss_grace_seconds: float = 900.0,
+) -> dict[str, Any]:
+    as_of_epoch = float(as_of_epoch if as_of_epoch is not None else datetime.now(UTC).timestamp())
     detections: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -374,16 +380,31 @@ def coverage_report(path: Path) -> dict[str, Any]:
 
     sources = ("polygon_onchain", "data_api")
     coverage = {"seen_by_both": 0, "onchain_only": 0, "data_api_only": 0}
+    mature_coverage = {"seen_by_both": 0, "onchain_only": 0, "data_api_only": 0}
+    mature_ids: set[str] = set()
+    metadata_resolved = metadata_unresolved = 0
     latencies: dict[str, list[float]] = {source: [] for source in sources}
     duplicates: dict[str, int] = {source: 0 for source in sources}
     first_seen = {"polygon_onchain": 0, "data_api": 0, "tie": 0}
     first_seen_deltas: list[float] = []
 
-    for by_source in detections.values():
+    for trade_id, by_source in detections.items():
         chain = by_source.get("polygon_onchain") or []
         api = by_source.get("data_api") or []
+        category = "seen_by_both" if chain and api else "onchain_only" if chain else "data_api_only"
+        coverage[category] += 1
+        all_rows = chain + api
+        ground_truth_epoch = min(float(row["ground_truth_epoch"]) for row in all_rows)
+        if ground_truth_epoch <= as_of_epoch - miss_grace_seconds:
+            mature_ids.add(trade_id)
+            mature_coverage[category] += 1
+        if chain:
+            first_chain = min(chain, key=lambda row: float(row["detection_epoch"]))
+            if first_chain.get("market") is not None:
+                metadata_resolved += 1
+            else:
+                metadata_unresolved += 1
         if chain and api:
-            coverage["seen_by_both"] += 1
             chain_time = min(float(row["detection_epoch"]) for row in chain)
             api_time = min(float(row["detection_epoch"]) for row in api)
             delta = api_time - chain_time
@@ -394,10 +415,6 @@ def coverage_report(path: Path) -> dict[str, Any]:
                 first_seen["data_api"] += 1
             else:
                 first_seen["tie"] += 1
-        elif chain:
-            coverage["onchain_only"] += 1
-        elif api:
-            coverage["data_api_only"] += 1
         for source in sources:
             source_rows = by_source.get(source) or []
             duplicates[source] += max(0, len(source_rows) - 1)
@@ -415,9 +432,15 @@ def coverage_report(path: Path) -> dict[str, Any]:
     for source in sources:
         duplicates[source] += duplicate_events[source]
         event_count = sum(bool(rows.get(source)) for rows in detections.values())
+        mature_event_count = sum(
+            trade_id in mature_ids and bool(rows.get(source))
+            for trade_id, rows in detections.items()
+        )
         lane_report[source] = {
             "event_count": event_count,
             "miss_count": total - event_count,
+            "mature_event_count": mature_event_count,
+            "mature_miss_count": len(mature_ids) - mature_event_count,
             "p50_latency_seconds": percentile(latencies[source], 0.5),
             "p90_latency_seconds": percentile(latencies[source], 0.9),
         }
@@ -428,6 +451,20 @@ def coverage_report(path: Path) -> dict[str, Any]:
         "ended_at": ended_at,
         "lanes": lane_report,
         "coverage": coverage,
+        "coverage_mature": {
+            **mature_coverage,
+            "grace_seconds": miss_grace_seconds,
+            "total_mature_events": len(mature_ids),
+        },
+        "metadata_resolution": {
+            "resolved": metadata_resolved,
+            "unresolved": metadata_unresolved,
+            "resolved_percent": (
+                100.0 * metadata_resolved / (metadata_resolved + metadata_unresolved)
+                if metadata_resolved + metadata_unresolved > 0
+                else None
+            ),
+        },
         "first_seen": first_seen,
         "first_seen_delta_seconds": {
             "p50": percentile(first_seen_deltas, 0.5),
@@ -447,7 +484,9 @@ def coverage_report(path: Path) -> dict[str, Any]:
             "connected_seconds_reported": connected_seconds,
             "downtime_seconds_reported": downtime_seconds,
             "uptime_percent_reported": (
-                100.0 * connected_seconds / (connected_seconds + downtime_seconds)
+                100.0
+                if rpc_connections > 0 and rpc_disconnects == 0
+                else 100.0 * connected_seconds / (connected_seconds + downtime_seconds)
                 if connected_seconds + downtime_seconds > 0
                 else None
             ),
