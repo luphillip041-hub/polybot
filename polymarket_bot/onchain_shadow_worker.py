@@ -344,6 +344,20 @@ class OnchainShadowWorker:
                 await self.process_data_api_row(row)
             await self._sleep(self.config.api_tail_seconds)
 
+    async def _fetch_logs_resilient(
+        self, start_block: int, end_block: int
+    ) -> list[dict[str, Any]]:
+        """Fetch logs while adapting to provider response-size limits."""
+        try:
+            return await asyncio.to_thread(self.rpc.logs, start_block, end_block)
+        except Exception:
+            if start_block >= end_block:
+                raise
+            middle = (start_block + end_block) // 2
+            left = await self._fetch_logs_resilient(start_block, middle)
+            right = await self._fetch_logs_resilient(middle + 1, end_block)
+            return left + right
+
     async def _backfill(self, latest: int, *, initial: bool) -> None:
         previous = self.current_head
         desired_start = (
@@ -369,7 +383,7 @@ class OnchainShadowWorker:
                 chunk_end = min(
                     latest, chunk_start + self.config.backfill_chunk_blocks - 1
                 )
-                rows = await asyncio.to_thread(self.rpc.logs, chunk_start, chunk_end)
+                rows = await self._fetch_logs_resilient(chunk_start, chunk_end)
                 for row in rows:
                     self.ingest_log(row, origin="initial_backfill" if initial else "gap_backfill")
                     logs_replayed += 1

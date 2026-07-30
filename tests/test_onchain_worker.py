@@ -96,6 +96,20 @@ def test_pre_window_backfill_is_not_counted_as_lane_detection(tmp_path: Path) ->
     }
 
 
+def test_resilient_log_fetch_splits_provider_limited_ranges(tmp_path: Path) -> None:
+    class LimitedRpc(FakeRpc):
+        def logs(self, start_block: int, end_block: int) -> list[dict]:
+            if end_block - start_block + 1 > 2:
+                raise RuntimeError("response too large")
+            return [{"block": block} for block in range(start_block, end_block + 1)]
+
+    cfg = config(tmp_path)
+    cfg.allowlist_path.write_text(json.dumps({"wallets": [TRACKED]}))
+    worker = OnchainShadowWorker(cfg, rpc=LimitedRpc())
+    rows = asyncio.run(worker._fetch_logs_resilient(10, 16))
+    assert [row["block"] for row in rows] == list(range(10, 17))
+
+
 class WrongBlockRpc(FakeRpc):
     def block(self, block_number: int) -> dict:
         row = super().block(block_number)
