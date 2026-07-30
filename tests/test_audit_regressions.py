@@ -117,3 +117,43 @@ def test_max_open_positions_rejects_buy_but_allows_existing_sell(tmp_path: Path)
     output = daemon.process_fill(sell, accepts_today=0)
     assert output[1]["type"] == "exit"
     assert "wallet:token-0" not in daemon.state["positions"]
+
+
+def test_positions_marks_many_positions_with_one_archive_lookup_and_no_rest(
+    tmp_path: Path, monkeypatch
+):
+    from polymarket_bot import status_api
+    from polymarket_bot.paper_follower import PaperConfig
+
+    state_path = tmp_path / "state.json"
+    positions = {
+        f"wallet:token-{i}": {
+            "wallet": "wallet",
+            "token": f"token-{i}",
+            "entry_price": 0.40,
+            "shares": 10.0,
+            "cost_usd": 4.0,
+            "opened_at": "2026-07-30T12:00:00+00:00",
+        }
+        for i in range(200)
+    }
+    state_path.write_text(json.dumps({"positions": positions, "processed_trade_ids": []}))
+    monkeypatch.setattr(
+        PaperConfig,
+        "load",
+        classmethod(lambda cls: PaperConfig(state_path=state_path)),
+    )
+    calls = []
+
+    def fake_archive_lookup(tokens, archive_dir=None):
+        calls.append(set(tokens))
+        return {token: {"best_bid": 0.50, "best_ask": 0.51} for token in tokens}
+
+    monkeypatch.setattr(status_api, "_latest_archived_books", fake_archive_lookup)
+    status_api._POS_CACHE.update({"ts": 0.0, "data": {}})
+    payload = status_api.get_positions()
+
+    assert payload["count"] == 200
+    assert payload["stale_marks"] == 0
+    assert len(calls) == 1
+    assert len(calls[0]) == 200

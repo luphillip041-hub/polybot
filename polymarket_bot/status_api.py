@@ -16,7 +16,6 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .archive_config import ArchiveConfig
-from .clob import best_bid_ask
 from .paper_follower import PaperConfig, paper_status, load_state
 
 app = FastAPI(title="Polymarket Copybot Status API", version="0.1.0", docs_url=None, redoc_url=None, openapi_url=None)
@@ -481,12 +480,44 @@ def get_paper() -> dict[str, Any]:
         return _PAPER_CACHE["data"]
 
 
+def _latest_archived_books(
+    tokens: set[str], archive_dir: Path | None = None
+) -> dict[str, dict[str, Any]]:
+    """Return recent archived book rows without any per-position REST calls."""
+    wanted = {token for token in tokens if token}
+    if not wanted:
+        return {}
+    found: dict[str, dict[str, Any]] = {}
+    # Hourly archive files: one day is enough for a current mark. Older rows are
+    # not live marks and should fall through to stale/entry_fallback semantics.
+    paths = sorted((archive_dir or ARCHIVE_DIR).glob("book_*.jsonl.gz"), reverse=True)[:24]
+    for path in paths:
+        missing = wanted - found.keys()
+        if not missing:
+            break
+        newest_in_file: dict[str, dict[str, Any]] = {}
+        try:
+            with gzip.open(path, "rt") as handle:
+                for line in handle:
+                    try:
+                        row = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    token = str(row.get("token_id") or "")
+                    if token in missing:
+                        newest_in_file[token] = row
+        except (OSError, EOFError):
+            continue
+        found.update(newest_in_file)
+    return found
+
+
 @app.get("/api/positions")
 def get_positions() -> dict[str, Any]:
     """List all open paper positions with current mark-to-market PnL.
 
-    For each open position, fetches a fresh top-of-book from CLOB REST to
-    compute unrealized PnL. Cached for 5s to avoid hammering the API.
+    Marks positions from the latest archived books used by the follower.
+    Cached for 5s to avoid repeatedly scanning compressed archive files.
     """
     now_ts = time.time()
     if now_ts - _POS_CACHE["ts"] < POSITIONS_CACHE_TTL:
@@ -504,6 +535,9 @@ def get_positions() -> dict[str, Any]:
     total_unrealized = 0.0
     total_cost = 0.0
     stale_marks = 0
+    archived_books = _latest_archived_books(
+        {str(pos.get("token") or "") for pos in raw_positions.values() if isinstance(pos, dict)}
+    )
     for pos_id, pos in raw_positions.items():
         if not isinstance(pos, dict):
             continue
@@ -513,10 +547,10 @@ def get_positions() -> dict[str, Any]:
         shares = float(pos.get("shares") or 0)
         entry_price = float(pos.get("entry_price") or 0)
         opened_at = pos.get("opened_at", "")
-        # Live mark via REST — use bid for long (mark to liquidation value)
+        # Use the archived bid for a long (mark to liquidation value).
         mark_status = "live"
         try:
-            book = best_bid_ask(token)
+            book = archived_books[str(token)]
             # A long can be liquidated only at the bid; the ask is not a valid mark.
             bid = book.get("best_bid")
             if bid and float(bid) > 0:

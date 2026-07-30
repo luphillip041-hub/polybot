@@ -12,7 +12,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 
 class PositionsEndpointTest(unittest.TestCase):
-    """Mock the CLOB + state, hit the endpoint via TestClient."""
+    """Mock the archived books + state, hit the endpoint via TestClient."""
 
     def setUp(self):
         from fastapi.testclient import TestClient
@@ -53,18 +53,16 @@ class PositionsEndpointTest(unittest.TestCase):
         )
         self._pc_patch.start()
 
-        # Patch best_bid_ask to return deterministic prices
-        def fake_best_bid_ask(token, config=None):
+        # Patch one archive lookup to return deterministic marks for all tokens.
+        def fake_archived_books(tokens, archive_dir=None):
             return {
-                "ok": True,
-                "best_bid": {"token_AAA": 0.75, "token_BBB": 0.99}.get(token, 0.5),
-                "best_ask": 0.99,
-                "spread": 0.05,
-                "tick_size": None,
-                "min_order_size": None,
-                "raw_error": None,
+                token: {
+                    "best_bid": {"token_AAA": 0.75, "token_BBB": 0.99}.get(token, 0.5),
+                    "best_ask": 0.99,
+                }
+                for token in tokens
             }
-        self._clob_patch = patch("polymarket_bot.status_api.best_bid_ask", fake_best_bid_ask)
+        self._clob_patch = patch("polymarket_bot.status_api._latest_archived_books", fake_archived_books)
         self._clob_patch.start()
 
         # Reset cache
