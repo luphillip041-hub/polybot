@@ -31,6 +31,7 @@ class PaperConfig:
     data_quality_path: Path = paper_dir / "data_quality.json"
     stake_usd: float = 100.0
     max_signals_per_day: int = int(os.getenv("PAPER_MAX_SIGNALS_PER_DAY", "60"))
+    max_open_positions: int = int(os.getenv("PAPER_MAX_OPEN_POSITIONS", "150"))
     max_spread: float = 0.04
     min_top3_liquidity_multiple: float = 2.0
     stale_fill_seconds: float = 480.0
@@ -572,6 +573,8 @@ def reject_reasons(
     token = str((row.get("trade") or {}).get("asset") or book.get("token_id") or "")
     if side == "BUY" and position_key(wallet, token) in state.get("positions", {}):
         reasons.append("duplicate")
+    if side == "BUY" and len(state.get("positions", {})) >= cfg.max_open_positions:
+        reasons.append("max_positions")
     if side == "SELL" and position_key(wallet, token) not in state.get("positions", {}):
         reasons.append("sell_no_position")
     return reasons
