@@ -31,9 +31,9 @@ from datetime import datetime, UTC, timedelta
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("polymarket_bot.wallet_quality")
+from .config import CONFIG
 
-LEDGER_PATH = Path("/root/flip/projects/polymarket-copybot/runs/paper/ledger.jsonl")
+logger = logging.getLogger("polymarket_bot.wallet_quality")
 
 _cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 CACHE_TTL = 60.0
@@ -50,9 +50,9 @@ def _parse_ts(raw: str) -> datetime | None:
         return None
 
 
-def _wallet_name_map() -> dict[str, str]:
+def _wallet_name_map(scores_path: Path | None = None) -> dict[str, str]:
     """Map wallet address → display name (from wallet_scores or fall through)."""
-    scores_path = Path("/root/flip/projects/polymarket-copybot/runs/wallet_scores_latest.json")
+    scores_path = scores_path or CONFIG.runs_dir / "wallet_scores_latest.json"
     if not scores_path.exists():
         return {}
     try:
@@ -108,11 +108,18 @@ class WalletStats:
         }
 
 
-def compute_wallet_quality(ledger_path: Path = LEDGER_PATH) -> list[dict[str, Any]]:
+def compute_wallet_quality(
+    ledger_path: Path | None = None,
+    *,
+    state_path: Path | None = None,
+    scores_path: Path | None = None,
+) -> list[dict[str, Any]]:
     """Compute quality scores for all wallets in the ledger.
 
     Returns list of wallet stats dicts, sorted by quality_score desc.
     """
+    ledger_path = ledger_path or CONFIG.runs_dir / "paper" / "ledger.jsonl"
+    state_path = state_path or CONFIG.runs_dir / "paper" / "state.json"
     cache_key = f"quality_{ledger_path}"
     now = time.time()
     if cache_key in _cache and (now - _cache[cache_key][0]) < CACHE_TTL:
@@ -121,7 +128,7 @@ def compute_wallet_quality(ledger_path: Path = LEDGER_PATH) -> list[dict[str, An
     if not ledger_path.exists():
         return []
 
-    name_map = _wallet_name_map()
+    name_map = _wallet_name_map(scores_path)
     stats_map: dict[str, WalletStats] = {}
 
     # Track entry→exit pairs for holding period
@@ -177,7 +184,6 @@ def compute_wallet_quality(ledger_path: Path = LEDGER_PATH) -> list[dict[str, An
         logger.exception("ledger read error: %s", e)
 
     # Get current open positions from state.json
-    state_path = Path("/root/flip/projects/polymarket-copybot/runs/paper/state.json")
     if state_path.exists():
         try:
             state = json.loads(state_path.read_text())

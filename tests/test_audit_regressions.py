@@ -189,3 +189,35 @@ def test_live_resolution_uses_fractional_payout_and_preserves_binary_outcomes(mo
     assert split_row is not None
     assert split_row["sim_fill_price"] == 0.5
     assert split_row["pnl"] == 1.0
+
+
+def test_bot_config_root_defaults_to_repo_not_cwd(tmp_path: Path, monkeypatch):
+    from polymarket_bot.config import BotConfig
+
+    monkeypatch.delenv("PROJECT_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    expected = Path(__file__).resolve().parents[1]
+    assert BotConfig().root == expected
+
+
+def test_wallet_quality_default_paths_follow_configured_runs_dir(tmp_path: Path, monkeypatch):
+    from polymarket_bot import wallet_quality
+
+    runs = tmp_path / "custom-runs"
+    paper = runs / "paper"
+    paper.mkdir(parents=True)
+    wallet = "0xabc"
+    (paper / "ledger.jsonl").write_text(
+        json.dumps({"type": "signal", "wallet": wallet, "ts": "2026-07-30T12:00:00+00:00"}) + "\n"
+    )
+    (paper / "state.json").write_text(json.dumps({"positions": {}}))
+    (runs / "wallet_scores_latest.json").write_text(
+        json.dumps([{"wallet": wallet, "name": "Configured Wallet"}])
+    )
+    monkeypatch.setattr(wallet_quality.CONFIG, "runs_dir", runs)
+    wallet_quality.clear_cache()
+
+    result = wallet_quality.compute_wallet_quality()
+
+    assert result[0]["wallet"] == wallet
+    assert result[0]["name"] == "Configured Wallet"

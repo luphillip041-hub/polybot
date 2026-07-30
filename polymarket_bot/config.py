@@ -53,9 +53,10 @@ class BotConfig:
 
     def __init__(self, **kwargs: Any) -> None:
         # Allow explicit overrides via kwargs
-        self.root: Path = Path(kwargs.get("root", "")) or Path(
-            env_str("PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))
+        root = kwargs.get("root") or env_str(
+            "PROJECT_ROOT", str(Path(__file__).resolve().parents[1])
         )
+        self.root: Path = Path(root)
         self.runs_dir: Path = Path(
             env_str("RUNS_DIR", str(self.root / "runs"))
         )
