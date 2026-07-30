@@ -39,6 +39,9 @@ class PaperConfig:
     poll_interval_seconds: float = 3.0
     stale_position_days: int = 14
     resolution_poll_seconds: float = float(os.getenv("POLYMARKET_RESOLUTION_POLL_SECONDS", "1800"))
+    quarantine_low_price: bool = os.getenv(
+        "PAPER_QUARANTINE_LOW_PRICE", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
 
     @classmethod
     def load(cls) -> "PaperConfig":
@@ -539,6 +542,10 @@ def reject_reasons(
         return reasons
     snap = book_snapshot(book)
     spread = snap.get("spread")
+    best_bid = num(snap.get("best_bid"), float("nan"))
+    best_ask = num(snap.get("best_ask"), float("nan"))
+    if best_bid >= best_ask:
+        reasons.append("crossed_book")
     if spread is None or num(spread) > cfg.max_spread:
         reasons.append("illiquid_spread")
     side = side_norm(row.get("fill_side") or (row.get("trade") or {}).get("side"))
@@ -578,6 +585,22 @@ def is_lottery_band(row: dict[str, Any]) -> bool:
     fill_price = row.get("fill_price") or (row.get("trade") or {}).get("price")
     side = side_norm(row.get("fill_side") or (row.get("trade") or {}).get("side"))
     return side == "BUY" and fill_price is not None and num(fill_price) < 0.10
+
+
+def quarantined_position_ids(rows: list[dict[str, Any]], cfg: PaperConfig) -> set[str]:
+    """Identify tagged and legacy sub-10-cent entries while quarantine is on."""
+    if not cfg.quarantine_low_price:
+        return set()
+    result: set[str] = set()
+    for row in rows:
+        if row.get("type") != "entry" or not row.get("position_id"):
+            continue
+        price = row.get("wallet_fill_price")
+        if row.get("quarantined_low_price") or (
+            price is not None and num(price, 1.0) < 0.10
+        ):
+            result.add(str(row["position_id"]))
+    return result
 
 
 # Path to a small JSON file the paper-follower writes tokens to that need
@@ -636,12 +659,14 @@ class PaperFollowerDaemon:
         start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
         rows = read_jsonl(self.cfg.ledger_path)
         todays_rows = [r for r in rows if (parse_ts(r.get("ts")) or start) >= start]
+        quarantined = quarantined_position_ids(rows, self.cfg)
         self._daily_key = today
         self._accepts_today = sum(1 for r in todays_rows if r.get("type") == "entry")
         self._pnl_today = sum(
             num(r.get("pnl"), 0)
             for r in todays_rows
-            if r.get("type") in {"exit", "resolution"}
+            if r.get("type") in {"exit", "resolution", "void_correction"}
+            and str(r.get("position_id") or "") not in quarantined
         )
 
     def signal_row(self, row: dict[str, Any], tid: str, latency: float | None) -> dict[str, Any]:
@@ -701,9 +726,10 @@ class PaperFollowerDaemon:
             ws_age_seconds=self._cycle_ws_age_seconds,
             inside_gap=inside_gap,
         )
-        lottery = is_lottery_band(row)
-        eligible_live = (len(reasons) == 0) and not lottery
+        quarantined_low_price = self.cfg.quarantine_low_price and is_lottery_band(row)
+        eligible_live = (len(reasons) == 0) and not quarantined_low_price
         out[0]["eligible_live"] = eligible_live
+        out[0]["quarantined_low_price"] = quarantined_low_price
         wallet = str(row.get("wallet") or "").lower()
         snap = book_snapshot(book)
         token = str(trade.get("asset") or book.get("token_id") or "")
@@ -711,11 +737,6 @@ class PaperFollowerDaemon:
         if reasons:
             # Hard rejection (illiquid, stale, etc.) — unchanged behavior; existing reject_type intact.
             rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": ",".join(reasons), "book_snapshot": snap})
-            out.append(rej)
-        elif lottery:
-            # Lottery band — reverted 2026-07-23 from reject to tag. Logged with eligible_live=False
-            # and type='ineligible' so it's distinguishable from hard rejects. Row preserved in ledger.
-            rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "ineligible", "reject_reason": "lottery_price_band", "book_snapshot": snap})
             out.append(rej)
         elif side != "SELL" and accepts_today >= self.cfg.max_signals_per_day:
             rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": "daily_entry_cap", "book_snapshot": snap})
@@ -732,7 +753,7 @@ class PaperFollowerDaemon:
                 proceeds = shares * (price or 0)
                 pnl = proceeds - num(pos.get("cost_usd"), 0)
                 self.state.get("positions", {}).pop(pos_id, None)
-                ex = dict(out[0]); ex.update({"ts": iso_now(), "type": "exit", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "pnl": pnl, "book_snapshot": snap})
+                ex = dict(out[0]); ex.update({"ts": iso_now(), "type": "exit", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "pnl": pnl, "book_snapshot": snap, "quarantined_low_price": bool(pos.get("quarantined_low_price"))})
             out.append(ex)
         else:
             price, shares, fill_err = simulate_fill(book, "BUY", self.cfg.stake_usd, self.cfg.haircut)
@@ -741,8 +762,8 @@ class PaperFollowerDaemon:
                 out.append(ent)
             else:
                 pos_id = position_key(wallet, token)
-                self.state.setdefault("positions", {})[pos_id] = {"position_id": pos_id, "wallet": wallet, "token": token, "entry_price": price, "shares": shares, "cost_usd": self.cfg.stake_usd, "opened_at": iso_now()}
-                ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "entry", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "book_snapshot": snap})
+                self.state.setdefault("positions", {})[pos_id] = {"position_id": pos_id, "wallet": wallet, "token": token, "entry_price": price, "shares": shares, "cost_usd": self.cfg.stake_usd, "opened_at": iso_now(), "quarantined_low_price": quarantined_low_price}
+                ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "entry", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "book_snapshot": snap, "quarantined_low_price": quarantined_low_price})
                 out.append(ent)
         self.state.setdefault("processed_trade_ids", []).append(tid)
         self.state["processed_trade_ids"] = list(dict.fromkeys(self.state["processed_trade_ids"]))[-20000:]
@@ -872,7 +893,8 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
     entries = [r for r in today_rows if r.get("type") == "entry"]
     rejects = [r for r in today_rows if r.get("type") == "reject"]
     ineligible = [r for r in today_rows if r.get("type") == "ineligible"]
-    exits = [r for r in rows if r.get("type") in {"exit", "resolution"}]
+    pnl_rows = [r for r in rows if r.get("type") in {"exit", "resolution", "void_correction"}]
+    quarantined = quarantined_position_ids(rows, cfg)
     rejects_by_reason: dict[str, int] = {}
     for row in rejects + ineligible:
         for reason in str(row.get("reject_reason") or "unknown").split(","):
@@ -893,10 +915,19 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
             b["signals"] += 1
         if row.get("type") == "entry":
             b["accepts"] += 1
-        if row.get("type") in {"exit", "resolution"}:
+        if (
+            row.get("type") in {"exit", "resolution", "void_correction"}
+            and str(row.get("position_id") or "") not in quarantined
+        ):
             b["pnl"] += num(row.get("pnl"), 0)
     latencies = [num(r.get("detection_latency_s"), 0) for r in signals if r.get("detection_latency_s") is not None]
-    realized = sum(num(r.get("pnl"), 0) for r in exits)
+    realized_including_quarantine = sum(num(r.get("pnl"), 0) for r in pnl_rows)
+    quarantined_realized = sum(
+        num(r.get("pnl"), 0)
+        for r in pnl_rows
+        if str(r.get("position_id") or "") in quarantined
+    )
+    realized = realized_including_quarantine - quarantined_realized
     open_notional = sum(num(pos.get("cost_usd"), 0) for pos in positions.values() if isinstance(pos, dict))
     unrealized = 0.0
     account_value = realized + unrealized + open_notional
@@ -917,7 +948,12 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
         else:
             entries_by_latency[">300s"] += 1
     # Realized PnL today (closes today) vs all-time
-    realized_today = sum(num(r.get("pnl"), 0) for r in rows if r.get("type") in {"exit", "resolution"} and (parse_ts(r.get("ts")) or today) >= today)
+    realized_today = sum(
+        num(r.get("pnl"), 0)
+        for r in pnl_rows
+        if (parse_ts(r.get("ts")) or today) >= today
+        and str(r.get("position_id") or "") not in quarantined
+    )
     last_ledger_ts = next(
         (row.get("ts") for row in reversed(rows) if row.get("ts")),
         None,
@@ -930,6 +966,8 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
         "rejects_today": len(rejects),
         "rejects_by_reason": rejects_by_reason,
         "realized_pnl": round(realized, 4),
+        "realized_pnl_including_quarantine": round(realized_including_quarantine, 4),
+        "quarantined_realized_pnl": round(quarantined_realized, 4),
         "realized_pnl_today": round(realized_today, 4),
         "unrealized_pnl": round(unrealized, 4),
         "open_notional": round(open_notional, 4),
@@ -1077,6 +1115,7 @@ def apply_resolution(state: dict[str, Any], action: dict[str, Any]) -> dict[str,
         "trade_id": None,
         "resolution_side": action.get("side"),
         "resolution_market_id": action.get("market_id"),
+        "quarantined_low_price": bool(pos.get("quarantined_low_price")),
     }
 
 

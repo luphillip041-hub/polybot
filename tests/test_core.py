@@ -27,11 +27,125 @@ from polymarket_bot.paper_follower import (
     run_resolution_cycle,
     check_positions_for_resolution,
     render_resolution_webhook,
+    reject_reasons,
 )
+from scripts.void_crossed_paper import build_void_corrections
 from polymarket_bot.gamma import resolved_outcome_for_token, markets_by_token
 
 
 class CoreTests(unittest.TestCase):
+    def test_crossed_book_is_hard_rejected_before_fill(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            archive = root / "archive"; archive.mkdir()
+            paper = root / "paper"; paper.mkdir()
+            cfg = PaperConfig(
+                paper_dir=paper,
+                ledger_path=paper / "ledger.jsonl",
+                state_path=paper / "state.json",
+                allowlist_path=paper / "allowlist.json",
+                data_quality_path=paper / "data_quality.json",
+                max_ws_age_seconds=999999999,
+            )
+            acfg = ArchiveConfig(
+                archive_dir=archive,
+                state_path=root / "shadow_state.json",
+                followup_queue_path=archive / "followups.json",
+            )
+            base = {
+                "ts": "2026-07-29T14:00:00+00:00",
+                "fill_timestamp": "2026-07-29T14:00:00+00:00",
+                "wallet": "0xw",
+                "fill_side": "BUY",
+                "fill_price": 0.50,
+                "trade": {"asset": "tok", "side": "BUY", "price": 0.50},
+            }
+            normal = dict(base)
+            normal["book_at_detection"] = {
+                "token_id": "tok", "best_bid": 0.49, "best_ask": 0.50,
+                "spread": 0.01, "top3_asks": [{"price": 0.50, "size": 1000}],
+            }
+            crossed = dict(base)
+            crossed["book_at_detection"] = {
+                "token_id": "tok", "best_bid": 0.60, "best_ask": 0.50,
+                "spread": 0.01, "top3_asks": [{"price": 0.50, "size": 1000}],
+            }
+            self.assertNotIn("crossed_book", reject_reasons(normal, cfg, acfg, {"positions": {}}, ws_age_seconds=0, inside_gap=False))
+            self.assertIn("crossed_book", reject_reasons(crossed, cfg, acfg, {"positions": {}}, ws_age_seconds=0, inside_gap=False))
+            locked = dict(base)
+            locked["book_at_detection"] = dict(normal["book_at_detection"], best_bid=0.50, spread=0.0)
+            self.assertIn("crossed_book", reject_reasons(locked, cfg, acfg, {"positions": {}}, ws_age_seconds=0, inside_gap=False))
+            daemon = PaperFollowerDaemon(cfg, acfg)
+            crossed["trade_id"] = "crossed"
+            output = daemon.process_fill(crossed, 0)
+            self.assertEqual(output[1]["type"], "reject")
+            self.assertIn("crossed_book", output[1]["reject_reason"])
+            self.assertFalse(daemon.state["positions"])
+            normal["trade_id"] = "normal"
+            normal_output = daemon.process_fill(normal, 0)
+            self.assertEqual(normal_output[1]["type"], "entry")
+            self.assertEqual(len(daemon.state["positions"]), 1)
+
+    def test_low_price_quarantine_excluded_from_headline_pnl(self):
+        with tempfile.TemporaryDirectory() as td:
+            paper = Path(td)
+            cfg = PaperConfig(
+                paper_dir=paper,
+                ledger_path=paper / "ledger.jsonl",
+                state_path=paper / "state.json",
+                allowlist_path=paper / "allowlist.json",
+                data_quality_path=paper / "data_quality.json",
+                quarantine_low_price=True,
+            )
+            rows = [
+                {"ts": "2026-07-29T12:00:00+00:00", "type": "entry", "position_id": "low", "wallet_fill_price": 0.05, "quarantined_low_price": True},
+                {"ts": "2026-07-29T13:00:00+00:00", "type": "resolution", "position_id": "low", "pnl": 1900.0},
+                {"ts": "2026-07-29T12:00:00+00:00", "type": "entry", "position_id": "normal", "wallet_fill_price": 0.50, "quarantined_low_price": False},
+                {"ts": "2026-07-29T13:00:00+00:00", "type": "resolution", "position_id": "normal", "pnl": 100.0},
+            ]
+            cfg.ledger_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            cfg.state_path.write_text(json.dumps({"positions": {}, "processed_trade_ids": []}))
+            status = paper_status(cfg)
+            self.assertEqual(status["realized_pnl"], 100.0)
+            self.assertEqual(status["realized_pnl_including_quarantine"], 2000.0)
+            self.assertEqual(status["quarantined_realized_pnl"], 1900.0)
+            cfg.quarantine_low_price = False
+            self.assertEqual(paper_status(cfg)["realized_pnl"], 2000.0)
+
+    def test_low_price_entry_is_retained_and_tagged(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); archive = root / "archive"; paper = root / "paper"
+            archive.mkdir(); paper.mkdir()
+            cfg = PaperConfig(
+                paper_dir=paper, ledger_path=paper / "ledger.jsonl",
+                state_path=paper / "state.json", allowlist_path=paper / "allowlist.json",
+                data_quality_path=paper / "data_quality.json", max_ws_age_seconds=999999999,
+                quarantine_low_price=True,
+            )
+            acfg = ArchiveConfig(archive_dir=archive, state_path=root / "shadow.json", followup_queue_path=archive / "followups.json")
+            daemon = PaperFollowerDaemon(cfg, acfg)
+            row = {
+                "ts": "2026-07-29T14:00:00+00:00", "fill_timestamp": "2026-07-29T14:00:00+00:00",
+                "wallet": "0xw", "trade_id": "low", "fill_side": "BUY", "fill_price": 0.05,
+                "trade": {"asset": "tok", "side": "BUY", "price": 0.05},
+                "book_at_detection": {"token_id": "tok", "best_bid": 0.04, "best_ask": 0.05,
+                    "spread": 0.01, "top3_asks": [{"price": 0.05, "size": 10000}]},
+            }
+            output = daemon.process_fill(row, 0)
+            self.assertEqual(output[1]["type"], "entry")
+            self.assertTrue(output[1]["quarantined_low_price"])
+            self.assertFalse(output[0]["eligible_live"])
+
+    def test_crossed_void_corrections_dedupe_duplicate_closes_and_runs(self):
+        entry = {"ts": "2026-07-29T12:00:00+00:00", "type": "entry", "position_id": "bad", "book_snapshot": {"best_bid": 0.60, "best_ask": 0.50}}
+        close = {"ts": "2026-07-29T13:00:00+00:00", "type": "resolution", "position_id": "bad", "pnl": 900.0}
+        duplicate_close = {"ts": "2026-07-29T13:01:00+00:00", "type": "resolution", "position_id": "bad", "pnl": 900.0}
+        corrections = build_void_corrections([entry, close, duplicate_close], now="2026-07-29T14:00:00+00:00")
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]["pnl"], -900.0)
+        self.assertEqual(corrections[0]["void_reason"], "crossed_book")
+        self.assertEqual(build_void_corrections([entry, close, duplicate_close, corrections[0]], now="later"), [])
+
     def test_flatten_market_maps_outcomes_prices_tokens(self):
         rows = flatten_markets([{"id":"e1","slug":"event","title":"Event","markets":[{"id":"m1","question":"Q","enableOrderBook":True,"outcomes":"['Yes','No']","outcomePrices":"['0.45','0.55']","clobTokenIds":"['y','n']","volume24hr":"10000","liquidity":"5000"}]}])
         self.assertEqual(rows[0]["outcomes"], ["Yes", "No"])
@@ -256,7 +370,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("stale_fill", rows[1]["reject_reason"])
             self.assertEqual(set(rows[1]["book_snapshot"].keys()), {"best_bid", "best_ask", "bid_size", "ask_size", "spread"})
             status = paper_status(cfg)
-            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "accepts_by_latency", "rejects_today", "rejects_by_reason", "realized_pnl", "realized_pnl_today", "unrealized_pnl", "open_notional", "account_value", "last_ledger_ts", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet", "signal_coverage_pct"})
+            self.assertEqual(set(status.keys()), {"positions_open", "signals_today", "accepts_today", "accepts_by_latency", "rejects_today", "rejects_by_reason", "realized_pnl", "realized_pnl_including_quarantine", "quarantined_realized_pnl", "realized_pnl_today", "unrealized_pnl", "open_notional", "account_value", "last_ledger_ts", "avg_detection_latency_s", "detection_latency_p50", "detection_latency_p90", "poll_interval_s", "per_wallet", "signal_coverage_pct"})
             self.assertGreaterEqual(status["rejects_today"], 1)
     def test_paper_follower_entry_and_exit_rows_include_book_snapshot(self):
         with tempfile.TemporaryDirectory() as td:
