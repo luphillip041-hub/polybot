@@ -518,7 +518,7 @@ def get_positions() -> dict[str, Any]:
     """List all open paper positions with current mark-to-market PnL.
 
     Marks positions from the latest archived books used by the follower.
-    Cached for 5s to avoid repeatedly scanning compressed archive files.
+    Cached for 15s to avoid repeatedly scanning compressed archive files.
     """
     now_ts = time.time()
     if now_ts - _POS_CACHE["ts"] < POSITIONS_CACHE_TTL:
