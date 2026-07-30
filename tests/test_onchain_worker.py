@@ -55,6 +55,7 @@ def test_worker_finalizes_only_after_confirmations_against_canonical_block(tmp_p
     cfg.allowlist_path.write_text(json.dumps({"wallets": [TRACKED]}))
     cfg.markets_path.write_text(json.dumps({"tokens": {}}))
     worker = OnchainShadowWorker(cfg, rpc=FakeRpc())
+    worker.started_at_epoch = 1785423172.0
     worker.ingest_log(TRACKED_MAKER_LOG, origin="live")
     asyncio.run(worker.finalize_ready(91_145_437, detection_epoch=1785423180.0))
     assert not cfg.output_path.exists()
@@ -77,6 +78,22 @@ def test_removed_log_records_reorg_without_detection(tmp_path: Path) -> None:
     rows = [json.loads(line) for line in cfg.output_path.read_text().splitlines()]
     assert [row["type"] for row in rows] == ["reorg_removed"]
     assert len(worker.confirmations) == 0
+
+
+def test_pre_window_backfill_is_not_counted_as_lane_detection(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    cfg.allowlist_path.write_text(json.dumps({"wallets": [TRACKED]}))
+    worker = OnchainShadowWorker(cfg, rpc=FakeRpc())
+    worker.started_at_epoch = 1785423174.0
+    worker.ingest_log(TRACKED_MAKER_LOG, origin="initial_backfill")
+    asyncio.run(worker.finalize_ready(91_145_438, detection_epoch=1785423181.0))
+    rows = [json.loads(line) for line in cfg.output_path.read_text().splitlines()]
+    assert [row["type"] for row in rows] == ["pre_window_event"]
+    assert rows[0]["source"] == "polygon_onchain"
+    assert rows[0]["ground_truth_epoch"] == 1785423173
+    assert worker.log.seen_onchain_event_ids == {
+        "0xa695db094e5c603e1e8d65d3dac1fe119475260ad8cffcbc31434ff752be4d99:838"
+    }
 
 
 class WrongBlockRpc(FakeRpc):

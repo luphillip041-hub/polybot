@@ -154,8 +154,7 @@ class OnchainShadowWorker:
             # tracked wallet's own order and is the only copyable record.
             self.stats["counterparty_only"] += 1
             return
-        lane_key = ("polygon_onchain", fill.durable_trade_id)
-        if lane_key in self.log.seen_lane_ids:
+        if fill.durable_trade_id in self.log.seen_onchain_event_ids:
             self.stats["duplicate_polygon_onchain"] += 1
             self.log.append(
                 {
@@ -223,6 +222,20 @@ class OnchainShadowWorker:
                 )
                 self.confirmations.add(fill)
                 continue
+            if ground_truth_epoch < self.started_at_epoch:
+                self.log.append(
+                    {
+                        "type": "pre_window_event",
+                        "source": "polygon_onchain",
+                        "durable_trade_id": fill.durable_trade_id,
+                        "transaction_hash": fill.transaction_hash,
+                        "log_index": fill.log_index,
+                        "ground_truth_epoch": ground_truth_epoch,
+                        "measurement_started_epoch": self.started_at_epoch,
+                    }
+                )
+                self.stats["pre_window_polygon_onchain"] += 1
+                continue
             row = lane_detection_row(
                 source="polygon_onchain",
                 fill=fill,
@@ -283,6 +296,21 @@ class OnchainShadowWorker:
             self.stats["cross_source_mismatches"] += 1
             return
         fill = match.fill
+        if float(ground_truth_epoch) < self.started_at_epoch:
+            self.log.append(
+                {
+                    "type": "pre_window_event",
+                    "source": "data_api",
+                    "durable_trade_id": fill.durable_trade_id,
+                    "transaction_hash": fill.transaction_hash,
+                    "log_index": fill.log_index,
+                    "ground_truth_epoch": ground_truth_epoch,
+                    "measurement_started_epoch": self.started_at_epoch,
+                    "api_observation_key": key or None,
+                }
+            )
+            self.stats["pre_window_data_api"] += 1
+            return
         lane_key = ("data_api", fill.durable_trade_id)
         if lane_key in self.log.seen_lane_ids:
             self.log.append(

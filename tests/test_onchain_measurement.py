@@ -30,6 +30,7 @@ def test_measurement_log_is_append_only_and_reloads_seen_ids(tmp_path: Path) -> 
     assert [row["source"] for row in rows] == ["polygon_onchain", "data_api"]
     reloaded = MeasurementLog(path)
     assert reloaded.seen_lane_ids == {("polygon_onchain", "0x1:2"), ("data_api", "0x1:2")}
+    assert reloaded.seen_onchain_event_ids == {"0x1:2"}
 
 
 def test_api_shadow_reader_tags_existing_collector_without_writing_it(tmp_path: Path) -> None:

@@ -79,6 +79,7 @@ class MeasurementLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.seen_lane_ids: set[tuple[str, str]] = set()
+        self.seen_onchain_event_ids: set[str] = set()
         self.seen_api_observations: set[str] = set()
         self._load_seen()
 
@@ -97,6 +98,14 @@ class MeasurementLog:
                         trade_id = str(row.get("durable_trade_id") or "")
                         if source and trade_id:
                             self.seen_lane_ids.add((source, trade_id))
+                            if source == "polygon_onchain":
+                                self.seen_onchain_event_ids.add(trade_id)
+                    if row.get("type") == "pre_window_event" and row.get(
+                        "source"
+                    ) == "polygon_onchain":
+                        trade_id = str(row.get("durable_trade_id") or "")
+                        if trade_id:
+                            self.seen_onchain_event_ids.add(trade_id)
                     api_key = row.get("api_observation_key")
                     if api_key:
                         self.seen_api_observations.add(str(api_key))
@@ -119,6 +128,14 @@ class MeasurementLog:
                 trade_id = str(payload.get("durable_trade_id") or "")
                 if source and trade_id:
                     self.seen_lane_ids.add((source, trade_id))
+                    if source == "polygon_onchain":
+                        self.seen_onchain_event_ids.add(trade_id)
+            if (
+                payload.get("type") == "pre_window_event"
+                and payload.get("source") == "polygon_onchain"
+                and payload.get("durable_trade_id")
+            ):
+                self.seen_onchain_event_ids.add(str(payload["durable_trade_id"]))
             if payload.get("api_observation_key"):
                 self.seen_api_observations.add(str(payload["api_observation_key"]))
 
