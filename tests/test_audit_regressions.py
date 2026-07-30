@@ -157,3 +157,35 @@ def test_positions_marks_many_positions_with_one_archive_lookup_and_no_rest(
     assert payload["stale_marks"] == 0
     assert len(calls) == 1
     assert len(calls[0]) == 200
+
+
+def test_live_resolution_uses_fractional_payout_and_preserves_binary_outcomes(monkeypatch):
+    from polymarket_bot import paper_follower
+
+    state = {
+        "positions": {
+            "split": {"token": "split", "shares": 10.0, "cost_usd": 4.0},
+            "winner": {"token": "winner", "shares": 10.0, "cost_usd": 4.0},
+            "loser": {"token": "loser", "shares": 10.0, "cost_usd": 4.0},
+        }
+    }
+    outcomes = {
+        "split": {"denom": 2, "n0": 1, "n1": 1, "side": "PRIMARY", "resolution_status": "PRIMARY"},
+        "winner": {"denom": 1, "n0": 1, "n1": 0, "side": "PRIMARY", "resolution_status": "PRIMARY"},
+        "loser": {"denom": 1, "n0": 0, "n1": 1, "side": "PRIMARY", "resolution_status": "SECONDARY"},
+    }
+
+    def fake_resolution(token, **kwargs):
+        return {"resolved": True, "question": "Q", "market_id": "M", **outcomes[token]}
+
+    monkeypatch.setattr(paper_follower, "_onchain_resolved_outcome_for_token", fake_resolution)
+    actions = paper_follower.check_positions_for_resolution(state)
+    prices = {action["pos_id"]: action["exit_price"] for action in actions}
+
+    assert prices == {"split": 0.5, "winner": 1.0, "loser": 0.0}
+    split_row = paper_follower.apply_resolution(
+        state, next(action for action in actions if action["pos_id"] == "split")
+    )
+    assert split_row is not None
+    assert split_row["sim_fill_price"] == 0.5
+    assert split_row["pnl"] == 1.0

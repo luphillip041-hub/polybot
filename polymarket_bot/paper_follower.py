@@ -1000,9 +1000,8 @@ def resolution_exit_price(side: str | None, outcome_status: str | object) -> flo
     Rules:
       - For both mapping styles, the principle is: did the index our token
         represents win? If yes -> exit at 1.0 (pays out $1 per share), else 0.0.
-      - We hold PRIMARY by construction (paper follower is long-only and the
-        CLOB returns tokens ordered as [primary, secondary] where primary is
-        the YES-equivalent).
+      - The follower can hold either PRIMARY or SECONDARY because it copies the
+        token traded by the leader.
     """
     status_upper = str(outcome_status or "").strip().upper()
     if status_upper in {"", "UNKNOWN", "NONE"}:
@@ -1068,7 +1067,17 @@ def check_positions_for_resolution(
         if not info.get("resolved"):
             actions.append({"action": "skip", "pos_id": pos_id, "reason": "not_resolved"})
             continue
-        exit_price = resolution_exit_price(info.get("side"), info.get("resolution_status"))
+        raw_value = info.get("raw")
+        raw: dict[str, Any] = raw_value if isinstance(raw_value, dict) else {}
+        denom = num(info.get("denom", raw.get("denom")), 0.0)
+        n0 = num(info.get("n0", raw.get("n0")), 0.0)
+        n1 = num(info.get("n1", raw.get("n1")), 0.0)
+        side = str(info.get("side") or "").upper()
+        if denom > 0 and side in {"PRIMARY", "SECONDARY"}:
+            numerator = n0 if side == "PRIMARY" else n1
+            exit_price = numerator / denom
+        else:
+            exit_price = resolution_exit_price(info.get("side"), info.get("resolution_status"))
         if exit_price is None:
             actions.append({"action": "skip", "pos_id": pos_id, "reason": "unmappable_outcome", "info": info})
             continue
@@ -1079,6 +1088,9 @@ def check_positions_for_resolution(
             "question": info.get("question"),
             "side": info.get("side"),
             "market_id": info.get("market_id"),
+            "denom": denom,
+            "n0": n0,
+            "n1": n1,
         })
     return actions
 

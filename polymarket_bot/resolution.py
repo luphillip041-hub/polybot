@@ -399,6 +399,9 @@ def resolved_outcome_for_token(
         "condition_id": cid,
         "closed": True,
         "active": False,
+        "denom": denom,
+        "n0": n0,
+        "n1": n1,
         "raw": {**info, "denom": denom, "n0": n0, "n1": n1},
     }
 
