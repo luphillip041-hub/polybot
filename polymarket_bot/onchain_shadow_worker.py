@@ -57,6 +57,8 @@ class OnchainShadowWorker:
         self.metadata = MetadataResolver(self.config.markets_path)
         self.confirmations = ConfirmationBuffer(self.config.confirmations)
         self.stats: Counter[str] = Counter()
+        self._tracked_wallets_cache: set[str] = set()
+        self._allowlist_mtime_ns: int | None = None
         self.running = True
         self.current_head: int | None = self._load_last_head()
         self.last_wss_message_epoch: float | None = None
@@ -93,7 +95,18 @@ class OnchainShadowWorker:
             return None
 
     def tracked_wallets(self) -> set[str]:
-        return load_tracked_wallets(self.config.allowlist_path)
+        try:
+            mtime_ns = self.config.allowlist_path.stat().st_mtime_ns
+        except OSError:
+            self._tracked_wallets_cache = set()
+            self._allowlist_mtime_ns = None
+            return set()
+        if mtime_ns != self._allowlist_mtime_ns:
+            self._tracked_wallets_cache = load_tracked_wallets(
+                self.config.allowlist_path
+            )
+            self._allowlist_mtime_ns = mtime_ns
+        return set(self._tracked_wallets_cache)
 
     def ingest_log(self, row: dict[str, Any], *, origin: str) -> None:
         try:

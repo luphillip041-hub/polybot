@@ -151,7 +151,15 @@ class ApiShadowReader:
 
     def read_new(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
+        # Only files that could contain detections from this measurement run
+        # are relevant.  Avoid re-inflating the full 45-day archive every 15s.
+        earliest_mtime = self.started_at_epoch - 3600
         for path in sorted(self.archive_dir.glob("shadow_*.jsonl.gz")):
+            try:
+                if path.stat().st_mtime < earliest_mtime:
+                    continue
+            except OSError:
+                continue
             try:
                 with gzip.open(path, "rt") as handle:
                     for line in handle:
