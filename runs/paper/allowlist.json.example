@@ -1,0 +1,10 @@
+{
+  "_comment": "Canonical allowlist snapshot, used to bootstrap runs/paper/allowlist.json if it is lost or reset. Source of truth for wallet set is bar.md (v1, 2026-08-05). S-Works (0xee00ba338c59557141789b127927a55f5cc5cea1) was removed in the same PR as bar.md: 4 entries, -$400 clean P&L, -100% clean ROI, n too small in either direction.",
+  "wallets": [
+    "0xfe787d2da716d60e8acff57fb87eb13cd4d10319",
+    "0x224a89dbe0db0d6124b335edabd15b3f877da3d5",
+    "0x4be1fa92e6ceaf886aac0bbec3be6c527133aa70",
+    "0x4bff30af91642dc7d2b19a8664378fe55c45fc26"
+  ],
+  "note": "4 configured wallets. S-Works (0xee00ba338c59557141789b127927a55f5cc5cea1) removed 2026-08-05: 4 entries, -$400 clean P&L, -100% clean ROI, n too small in either direction. See bar.md. eligible_live tag on the row gates execution; the allowlist itself is observation-only as of 2026-07-23 (per review: filters belong in the execution path, not the observation path)."
+}
