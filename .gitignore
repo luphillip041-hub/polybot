@@ -1,5 +1,10 @@
 __pycache__/
 *.pyc
-runs/
 .env
 .venv/
+# runs/ is runtime state (ledger, heartbeat, snapshots). Only the canonical
+# allowlist example is tracked; everything else in runs/ stays ignored.
+runs/*
+!runs/paper/
+runs/paper/*
+!runs/paper/allowlist.json.example
