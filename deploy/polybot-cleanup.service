@@ -6,7 +6,7 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=root
-ExecStart=/root/flip/projects/polymarket-copybot/.venv/bin/python -m polymarket_bot.cleanup --max-gb 1.75
+ExecStart=/root/flip/projects/polymarket-copybot/.venv/bin/python -m polymarket_bot.cleanup --max-gb 1.50
 WorkingDirectory=/root/flip/projects/polymarket-copybot
 Environment=PYTHONPATH=/root/flip/projects/polymarket-copybot
 StandardOutput=journal

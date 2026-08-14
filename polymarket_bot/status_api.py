@@ -223,9 +223,18 @@ class RollingState:
                     self.gap_rows.append(row)
             if path.exists():
                 self.offsets[str(path)] = path.stat().st_size
+        shadow_keys = {
+            key for row in self.shadow_rows
+            if (key := self._shadow_dedupe_key(row)) is not None
+        }
         for path in jsonl_paths("shadow", start, end):
             for row in iter_gzip_jsonl(path, self.offsets.get(str(path), 0)):
+                key = self._shadow_dedupe_key(row)
+                if key is not None and key in shadow_keys:
+                    continue
                 self.shadow_rows.append(row)
+                if key is not None:
+                    shadow_keys.add(key)
                 if len(self.shadow_rows) > 30_000:
                     del self.shadow_rows[:10_000]
             if path.exists():
@@ -238,7 +247,7 @@ class RollingState:
         ]
         self.shadow_rows = [
             r for r in self.shadow_rows
-            if (parse_ts(r.get("ts") or r.get("fill_timestamp")) or utc_now()) >= cutoff_7d
+            if (parse_ts(r.get("fill_timestamp") or r.get("ts")) or utc_now()) >= cutoff_7d
         ][-30_000:]
         self.gap_rows = self.gap_rows[-10_000:]
 
@@ -318,12 +327,30 @@ class RollingState:
             })
         return rows
 
+    @staticmethod
+    def _shadow_dedupe_key(row: dict[str, Any]) -> tuple[Any, ...] | None:
+        kind = str(row.get("type") or row.get("kind") or "")
+        raw_trade = row.get("trade")
+        trade: dict[str, Any] = raw_trade if isinstance(raw_trade, dict) else {}
+        tid = str(row.get("trade_id") or row.get("fill_id") or trade.get("transactionHash") or "")
+        if not tid:
+            return None
+        return (kind, tid, row.get("offset_seconds") if kind == "followup_book" else None)
+
     def _shadow_rows(self, kind: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
         for r in self.shadow_rows:
             if (r.get("type") or r.get("kind")) != kind:
                 continue
-            ts = parse_ts(r.get("ts") or r.get("fill_timestamp"))
+            key = self._shadow_dedupe_key(r)
+            if key is not None:
+                if key in seen:
+                    continue
+                seen.add(key)
+            # A duplicate journal row has a fresh row timestamp but the same
+            # original fill timestamp. Day attribution must use the fill time.
+            ts = parse_ts(r.get("fill_timestamp") or r.get("ts"))
             if ts and start <= ts < end:
                 out.append(r)
         return out
@@ -368,11 +395,9 @@ class RollingState:
         for configured in configured_wallets():
             wallet = configured["wallet"]
             by_wallet[wallet] = {"name": configured["name"], "fills_today": 0, "fills_7d": 0, "last_fill_ts": None, "markets": set()}
-        for r in self.shadow_rows:
-            if (r.get("type") or r.get("kind")) != "fill":
-                continue
-            ts = parse_ts(r.get("ts") or r.get("fill_timestamp"))
-            if not ts or ts < week_start:
+        for r in self._shadow_rows("fill", week_start, now + timedelta(seconds=1)):
+            ts = parse_ts(r.get("fill_timestamp") or r.get("ts"))
+            if not ts:
                 continue
             trade = r.get("trade") if isinstance(r.get("trade"), dict) else {}
             wallet = str(r.get("wallet") or trade.get("proxyWallet") or "unknown").lower()

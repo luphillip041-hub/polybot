@@ -251,9 +251,12 @@ class CoreTests(unittest.TestCase):
             {"type": "gap", "start_ts": today.isoformat(), "end_ts": (today.replace(minute=1)).isoformat(), "reason": "unit"},
         ]
         st.shadow_rows = [
-            {"type": "fill", "ts": now.isoformat(), "wallet": "0xw", "trade": {"name": "demo", "conditionId": "m1"}},
-            {"type": "followup_book", "ts": now.isoformat(), "wallet": "0xw", "fill_price": 0.5, "fill_side": "BUY"},
-            {"type": "followup_missed", "ts": now.isoformat(), "wallet": "0xw"},
+            {"type": "fill", "trade_id": "t1", "ts": now.isoformat(), "wallet": "0xw", "trade": {"name": "demo", "conditionId": "m1"}},
+            {"type": "fill", "trade_id": "t1", "ts": now.isoformat(), "wallet": "0xw", "trade": {"name": "demo", "conditionId": "m1"}},
+            {"type": "followup_book", "trade_id": "t1", "offset_seconds": 300, "ts": now.isoformat(), "wallet": "0xw", "fill_price": 0.5, "fill_side": "BUY"},
+            {"type": "followup_book", "trade_id": "t1", "offset_seconds": 300, "ts": now.isoformat(), "wallet": "0xw", "fill_price": 0.5, "fill_side": "BUY"},
+            {"type": "followup_missed", "trade_id": "t1", "ts": now.isoformat(), "wallet": "0xw"},
+            {"type": "followup_missed", "trade_id": "t1", "ts": now.isoformat(), "wallet": "0xw"},
         ]
         out = st.status()
         self.assertEqual(set(out.keys()), {"generated_at", "archiver", "gaps_today", "coverage_pct_today", "shadow", "wallets"})
@@ -287,6 +290,37 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(rows[0]["trade_id"], tid)
             saved = json.loads(state.read_text())
             self.assertIn(tid, saved["journaled_trade_ids"])
+
+    def test_trade_id_cap_preserves_newest_ids_in_order(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = ArchiveConfig(
+                archive_dir=root,
+                state_path=root / "state.json",
+                followup_queue_path=root / "followups.json",
+            )
+            daemon = BookArchiveDaemon(cfg)
+            cap = book_archive_module.MAX_PERSISTED_TRADE_IDS
+            daemon.state = {
+                "seen_trade_ids": [f"seen-{i}" for i in range(cap + 2)],
+                "journaled_trade_ids": [f"journaled-{i}" for i in range(cap + 2)],
+            }
+            daemon._save_state()
+            saved = json.loads(cfg.state_path.read_text())
+            self.assertEqual(len(saved["journaled_trade_ids"]), cap)
+            self.assertNotIn("journaled-0", saved["journaled_trade_ids"])
+            self.assertEqual(saved["journaled_trade_ids"][-1], f"journaled-{cap + 1}")
+
+    def test_followup_queue_dedupes_trade_and_offset(self):
+        rows = [
+            {"trade_id": "t1", "offset_seconds": 300, "due_ts": 30},
+            {"trade_id": "t1", "offset_seconds": 300, "due_ts": 20},
+            {"trade_id": "t1", "offset_seconds": 900, "due_ts": 40},
+        ]
+        deduped = BookArchiveDaemon._dedupe_followup_queue(rows)
+        self.assertEqual(len(deduped), 2)
+        by_offset = {row["offset_seconds"]: row for row in deduped}
+        self.assertEqual(by_offset[300]["due_ts"], 20)
 
     def test_ws_stale_timeout_writes_gap_and_resubscribes(self):
         class FakeWebsocket:

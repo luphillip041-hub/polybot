@@ -24,6 +24,8 @@ from .paper import write_json
 
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 LOG = logging.getLogger("polymarket_book_archive")
+MAX_PERSISTED_TRADE_IDS = 50_000
+MAX_FOLLOWUP_QUEUE_ITEMS = 10_000
 
 
 def utc_now() -> datetime:
@@ -171,11 +173,14 @@ class BookArchiveDaemon:
                             ids.append(str(row["trade_id"]))
         except Exception:
             LOG.exception("failed to load journaled shadow trade ids")
-        return list(dict.fromkeys(ids))[-10000:]
+        return list(dict.fromkeys(ids))[-MAX_PERSISTED_TRADE_IDS:]
 
     def _save_state(self) -> None:
-        seen = list(dict.fromkeys(self.state.get("seen_trade_ids", [])))[-10000:]
-        journaled = list(dict.fromkeys(self.state.get("journaled_trade_ids", [])))[-10000:]
+        # Preserve insertion order before applying the cap. Converting these
+        # lists through set() randomizes eviction and causes still-current API
+        # trades to be re-journaled on every poll once the cap is full.
+        seen = list(dict.fromkeys(self.state.get("seen_trade_ids", [])))[-MAX_PERSISTED_TRADE_IDS:]
+        journaled = list(dict.fromkeys(self.state.get("journaled_trade_ids", [])))[-MAX_PERSISTED_TRADE_IDS:]
         self.state = {"seen_trade_ids": seen, "journaled_trade_ids": journaled}
         self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.config.state_path.with_suffix(".tmp")
@@ -187,17 +192,39 @@ class BookArchiveDaemon:
         if path.exists():
             try:
                 data = json.loads(path.read_text())
-                return data if isinstance(data, list) else []
+                return self._dedupe_followup_queue(data if isinstance(data, list) else [])
             except Exception:
                 LOG.exception("failed to load followup queue; starting empty")
         # One-time migration from old combined state.
         old_pending = self.state.get("pending_observations", [])
-        return old_pending if isinstance(old_pending, list) else []
+        return self._dedupe_followup_queue(old_pending if isinstance(old_pending, list) else [])
+
+    @staticmethod
+    def _dedupe_followup_queue(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep one earliest-due follow-up per trade and offset."""
+        by_key: dict[tuple[str, int], dict[str, Any]] = {}
+        for item in items:
+            tid = str(item.get("trade_id") or "")
+            raw_offset = item.get("offset_seconds")
+            if raw_offset is None:
+                continue
+            try:
+                offset = int(raw_offset)
+            except (TypeError, ValueError):
+                continue
+            if not tid:
+                continue
+            key = (tid, offset)
+            current = by_key.get(key)
+            if current is None or float(item.get("due_ts") or 0) < float(current.get("due_ts") or 0):
+                by_key[key] = item
+        return sorted(by_key.values(), key=lambda item: float(item.get("due_ts") or 0))[-MAX_FOLLOWUP_QUEUE_ITEMS:]
 
     def _save_followup_queue(self) -> None:
+        self.followup_queue = self._dedupe_followup_queue(self.followup_queue)
         self.config.followup_queue_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.config.followup_queue_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.followup_queue[-10000:], indent=2, sort_keys=True, default=str))
+        tmp.write_text(json.dumps(self.followup_queue, indent=2, sort_keys=True, default=str))
         tmp.replace(self.config.followup_queue_path)
 
     def _mark_startup_missed_followups(self) -> None:
@@ -221,7 +248,7 @@ class BookArchiveDaemon:
                 "fill_id": fid,
                 "trade_id": fid,
                 "wallet": bucket.get("wallet"),
-                "offsets_missed": sorted(bucket.get("offsets_missed") or []),
+                "offsets_missed": sorted(set(bucket.get("offsets_missed") or [])),
                 **trade_fill_context(bucket.get("trade") or {}),
             }
             self.append_row("shadow", row)
@@ -769,8 +796,14 @@ class BookArchiveDaemon:
     def poll_wallets_once(self) -> None:
         # Pick up tokens the paper follower had to backstop (cross-daemon handoff)
         self._add_priority_tokens()
-        seen: set[str] = set(self.state.get("seen_trade_ids", []))
-        journaled: set[str] = set(self.state.get("journaled_trade_ids", []))
+        seen_order = list(dict.fromkeys(self.state.get("seen_trade_ids", [])))
+        journaled_order = list(dict.fromkeys(self.state.get("journaled_trade_ids", [])))
+        seen: set[str] = set(seen_order)
+        journaled: set[str] = set(journaled_order)
+        queued_followups = {
+            (str(item.get("trade_id") or ""), int(item.get("offset_seconds") or 0))
+            for item in self.followup_queue
+        }
         for wallet in self._configured_wallets():
             try:
                 trades = user_trades(wallet, self.config.trade_poll_limit)
@@ -780,7 +813,9 @@ class BookArchiveDaemon:
             for trade in trades:
                 self.stats.wallet_trades_seen += 1
                 tid = trade_id(trade)
-                seen.add(tid)
+                if tid not in seen:
+                    seen.add(tid)
+                    seen_order.append(tid)
                 # Log per-fill detection latency: poller_seen_ts - fill_ts
                 fill_ts = self._trade_timestamp(trade)
                 poller_seen_ts = time.time()
@@ -810,6 +845,7 @@ class BookArchiveDaemon:
                 self.append_row("shadow", row)
                 self.stats.shadow_rows_written += 1
                 journaled.add(tid)
+                journaled_order.append(tid)
                 if matched:
                     self.stats.wallet_trades_matched += 1
                     now = time.time()
@@ -819,9 +855,12 @@ class BookArchiveDaemon:
                     if missed_offsets:
                         self._mark_followups_missed_for_trade(wallet, tid, trade, missed_offsets)
                     for offset in pending_offsets:
-                        self.followup_queue.append({"due_ts": now + offset, "offset_seconds": offset, "wallet": wallet, "trade_id": tid, "trade": trade})
-        self.state["seen_trade_ids"] = list(seen)
-        self.state["journaled_trade_ids"] = list(journaled)
+                        key = (tid, int(offset))
+                        if key not in queued_followups:
+                            self.followup_queue.append({"due_ts": now + offset, "offset_seconds": offset, "wallet": wallet, "trade_id": tid, "trade": trade})
+                            queued_followups.add(key)
+        self.state["seen_trade_ids"] = seen_order
+        self.state["journaled_trade_ids"] = journaled_order
         self._process_due_followups()
         self.flush_prefix("shadow")
         self._save_state()
