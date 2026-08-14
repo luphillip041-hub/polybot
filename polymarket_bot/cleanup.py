@@ -66,6 +66,9 @@ class CleanupResult:
     duration_s: float = 0.0
     total_before_bytes: int = 0
     total_after_bytes: int = 0
+    # Internal only: prevents dry-run retention candidates from being counted
+    # a second time by hard-cap simulation.
+    planned_deletions: set[Path] = field(default_factory=set, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -126,8 +129,11 @@ def _prune_old_files(
             continue
         if age > retention_days:
             try:
-                freed += _safe_delete(path, dry_run)
-                result.files_deleted += 1
+                deleted_bytes = _safe_delete(path, dry_run)
+                freed += deleted_bytes
+                if deleted_bytes:
+                    result.files_deleted += 1
+                    result.planned_deletions.add(path)
             except Exception as e:
                 result.errors.append(f"delete {path}: {e}")
     return freed
@@ -180,14 +186,27 @@ def _hard_cap(runs_dir: Path, max_gb: float, dry_run: bool, result: CleanupResul
         key=lambda p: p.stat().st_mtime,
     )
     freed = 0
+    # A dry run leaves files on disk, so filesystem recomputation cannot show
+    # simulated progress. Start from the post-retention projection instead.
+    projected_size = total_bytes - result.bytes_freed
     for path in shadow_files:
-        # Recompute current size each iteration so we land under cap
-        current_size = sum(p.stat().st_size for p in runs_dir.rglob("*") if p.is_file())
+        if path in result.planned_deletions:
+            continue
+        # Actual cleanup recomputes from disk each iteration. Dry-run cleanup
+        # advances a projected total so it stops after the required candidates.
+        current_size = projected_size if dry_run else sum(
+            p.stat().st_size for p in runs_dir.rglob("*") if p.is_file()
+        )
         if current_size <= cap_bytes:
             break
         try:
-            freed += _safe_delete(path, dry_run)
-            result.files_deleted += 1
+            deleted_bytes = _safe_delete(path, dry_run)
+            freed += deleted_bytes
+            if deleted_bytes:
+                result.files_deleted += 1
+                result.planned_deletions.add(path)
+                if dry_run:
+                    projected_size -= deleted_bytes
         except Exception as e:
             result.errors.append(f"hard_cap delete {path}: {e}")
     return freed

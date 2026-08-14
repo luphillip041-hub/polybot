@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,13 +18,24 @@ class TimeseriesTest(unittest.TestCase):
         timeseries.clear_cache()
         self.tmpdir = tempfile.mkdtemp()
         self.ledger = Path(self.tmpdir) / "ledger.jsonl"
-        # Write a small ledger with 3 days of exit events
+        # Write a small ledger with exit events on the final three days of
+        # the rolling four-day window. Relative dates keep this test stable.
+        today = datetime.now(timezone.utc).date()
+        day_1 = today - timedelta(days=2)
+        day_2 = today - timedelta(days=1)
+        day_3 = today
+
+        def ts(day, hour):
+            return datetime.combine(
+                day, datetime.min.time(), tzinfo=timezone.utc
+            ).replace(hour=hour).isoformat()
+
         rows = [
-            {"ts": "2026-07-26T10:00:00+00:00", "type": "exit", "wallet": "0xAAA", "pnl": 100.0},
-            {"ts": "2026-07-26T14:00:00+00:00", "type": "exit", "wallet": "0xBBB", "pnl": -50.0},
-            {"ts": "2026-07-27T09:00:00+00:00", "type": "exit", "wallet": "0xAAA", "pnl": 200.0},
-            {"ts": "2026-07-28T11:00:00+00:00", "type": "exit", "wallet": "0xBBB", "pnl": 75.0},
-            {"ts": "2026-07-28T12:00:00+00:00", "type": "signal", "wallet": "0xAAA", "pnl": 999.0},  # not exit
+            {"ts": ts(day_1, 10), "type": "exit", "wallet": "0xAAA", "pnl": 100.0},
+            {"ts": ts(day_1, 14), "type": "exit", "wallet": "0xBBB", "pnl": -50.0},
+            {"ts": ts(day_2, 9), "type": "exit", "wallet": "0xAAA", "pnl": 200.0},
+            {"ts": ts(day_3, 11), "type": "exit", "wallet": "0xBBB", "pnl": 75.0},
+            {"ts": ts(day_3, 12), "type": "signal", "wallet": "0xAAA", "pnl": 999.0},  # not exit
         ]
         with open(self.ledger, "w") as f:
             for r in rows:

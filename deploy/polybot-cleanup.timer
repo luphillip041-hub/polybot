@@ -1,9 +1,9 @@
 [Unit]
-Description=Polybot cleanup — daily at 02:00 UTC
+Description=Polybot cleanup — every six hours
 Documentation=https://github.com/luphillip041-hub/polybot
 
 [Timer]
-OnCalendar=*-*-* 02:00:00
+OnCalendar=*-*-* 02,08,14,20:00:00 UTC
 Persistent=false
 RandomizedDelaySec=600
 Unit=polybot-cleanup.service

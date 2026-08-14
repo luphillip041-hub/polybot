@@ -137,6 +137,44 @@ class CleanupTest(unittest.TestCase):
         new_total = sum(p.stat().st_size for p in self.runs_dir.rglob("*") if p.is_file())
         self.assertLessEqual(new_total, cap_bytes)
 
+    def test_hard_cap_dry_run_stops_at_projected_cap(self):
+        for i in range(5):
+            self._make_file(
+                f"shadow_2026-07-20_{i:02d}.jsonl.gz",
+                age_days=0,
+                content=b"X" * (1024 * 1024),
+            )
+        cap_bytes = 4 * 1024 * 1024
+        before = sum(p.stat().st_size for p in self.runs_dir.rglob("*") if p.is_file())
+        result = self.cleanup.run_cleanup(
+            runs_dir=self.runs_dir,
+            book_retention_days=999,
+            shadow_retention_days=999,
+            max_gb=cap_bytes / (1024 ** 3),
+            dry_run=True,
+        )
+        self.assertLessEqual(result.total_after_bytes, cap_bytes)
+        self.assertGreater(result.total_after_bytes, 0)
+        # Eight shadow files exist; the projection must stop before proposing
+        # deletion of every candidate (the old dry-run bug deleted all eight).
+        self.assertLess(result.files_deleted, 8)
+        after = sum(p.stat().st_size for p in self.runs_dir.rglob("*") if p.is_file())
+        self.assertEqual(after, before)
+
+    def test_dry_run_does_not_double_count_retention_candidates(self):
+        result = self.cleanup.run_cleanup(
+            runs_dir=self.runs_dir,
+            book_retention_days=7,
+            shadow_retention_days=7,
+            max_gb=0.0001,
+            dry_run=True,
+        )
+        candidate_sizes = sum(
+            p.stat().st_size
+            for p in (self.runs_dir / "book_archive").glob("*.jsonl.gz")
+        )
+        self.assertLessEqual(result.bytes_freed, candidate_sizes)
+
     def test_trims_large_ledger(self):
         # Create a large ledger
         (self.runs_dir / "paper").mkdir(exist_ok=True)
