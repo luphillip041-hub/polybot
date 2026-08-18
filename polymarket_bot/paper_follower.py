@@ -7,13 +7,14 @@ import os
 import signal
 import time
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .archive_config import ArchiveConfig
-from .book_archive import trade_id
+from .book_archive import bbo_from_levels, normalize_levels, trade_id
 from .config import BotConfig, CONFIG
 from .alerts import send_telegram
 from .resolution import TokenMap, resolved_outcome_for_token as _onchain_resolved_outcome_for_token, RpcClient
@@ -29,6 +30,12 @@ class PaperConfig:
     state_path: Path = paper_dir / "state.json"
     allowlist_path: Path = paper_dir / "allowlist.json"
     data_quality_path: Path = paper_dir / "data_quality.json"
+    onchain_log_path: Path | None = None
+    onchain_primary_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "POLYMARKET_ONCHAIN_PRIMARY", "true"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+    )
     stake_usd: float = 100.0
     max_signals_per_day: int = int(os.getenv("PAPER_MAX_SIGNALS_PER_DAY", "60"))
     max_open_positions: int = int(os.getenv("PAPER_MAX_OPEN_POSITIONS", "150"))
@@ -49,6 +56,12 @@ class PaperConfig:
     @classmethod
     def load(cls) -> "PaperConfig":
         cfg = cls()
+        cfg.onchain_log_path = Path(
+            os.getenv(
+                "POLYMARKET_ONCHAIN_LOG",
+                str(cfg.root / "runs" / "onchain_shadow" / "shadow_onchain.jsonl"),
+            )
+        )
         cfg.paper_dir.mkdir(parents=True, exist_ok=True)
         if not cfg.allowlist_path.exists():
             cfg.allowlist_path.write_text(json.dumps({"wallets": [w["wallet"] for w in configured_wallets()]}, indent=2))
@@ -186,7 +199,9 @@ def book_snapshot(book: dict[str, Any] | None) -> dict[str, Any]:
 # BBO_BACKSTOP_TTL_SEC so we don't double-snap. Helps paper fills that arrive
 # before the archive WS catches up — eliminates most no_archived_book rejects.
 _BBO_BACKSTOP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-BBO_BACKSTOP_TTL_SEC = 30.0
+# Execution-time books must stay fresh.  The follower loops every three seconds,
+# so a two-second cache only coalesces same-burst wallet fills.
+BBO_BACKSTOP_TTL_SEC = 2.0
 
 
 def _clean_bbo_cache() -> None:
@@ -197,56 +212,43 @@ def _clean_bbo_cache() -> None:
         _BBO_BACKSTOP_CACHE.pop(t, None)
 
 
-def rest_backstop_bbo(token: str) -> dict[str, Any] | None:
-    """Hit CLOB REST for a fresh BBO when archive hasn't caught up.
+def live_clob_book(token: str, *, use_cache: bool = True) -> dict[str, Any] | None:
+    """Fetch and normalize an executable top-three CLOB book.
 
-    Returns a normalized book dict compatible with book_snapshot() (keys
-    best_bid, best_ask, best_bid_size, best_ask_size, spread). Cached for
-    30s so multiple signals for the same token don't re-snap.
-
-    Returns None on REST failure (e.g., dead token, network error).
+    One `/book` request supplies both BBO and depth.  Returning only BBO would
+    make `simulate_fill` reject every on-chain signal as `missing_book`.
     """
-    from .clob import best_bid_ask as _best_bid_ask
+    from .clob import order_book
+
     _clean_bbo_cache()
     if not token:
         return None
     cached = _BBO_BACKSTOP_CACHE.get(token)
-    if cached:
+    if use_cache and cached:
         return cached[1]
     try:
-        result = _best_bid_ask(token)
-        if not result.get("ok"):
+        raw = order_book(token)
+        bids = normalize_levels(raw.get("bids"), reverse=True)
+        asks = normalize_levels(raw.get("asks"), reverse=False)
+        if not bids or not asks:
             return None
-        bid = result.get("best_bid")
-        ask = result.get("best_ask")
-        if bid is None or ask is None:
-            return None
-        # Estimate top-of-book size (CLOB REST /book only has price levels;
-        # use min_order_size as proxy for size, or a fixed liquidity marker)
-        from .http import get_json
-        try:
-            book = get_json(CONFIG.clob_base, "/book", {"token_id": token}, user_agent=CONFIG.user_agent)
-            bids = book.get("bids") or []
-            asks = book.get("asks") or []
-            bid_size = float(bids[0]["size"]) if bids else 100.0
-            ask_size = float(asks[0]["size"]) if asks else 100.0
-        except Exception:
-            bid_size = ask_size = 100.0  # conservative default
-        spread = ask - bid
         snap = {
-            "best_bid": bid,
-            "best_ask": ask,
-            "best_bid_size": bid_size,
-            "best_ask_size": ask_size,
-            "spread": spread,
             "token_id": token,
-            "_source": "rest_backstop",
+            "top3_bids": bids,
+            "top3_asks": asks,
+            **bbo_from_levels(bids, asks),
+            "_source": "clob_rest_live",
         }
         _BBO_BACKSTOP_CACHE[token] = (time.time(), snap)
         return snap
     except Exception:
         LOG.warning("rest_backstop_bbo failed for token=%s", token[:12])
         return None
+
+
+def rest_backstop_bbo(token: str) -> dict[str, Any] | None:
+    """Backward-compatible alias for the full live CLOB book fetch."""
+    return live_clob_book(token)
 
 
 def top3_notional(book: dict[str, Any], side: str) -> float:
@@ -379,6 +381,80 @@ def _iter_new_fills_from_path(path: Path, offset: int = 0) -> tuple[list[dict[st
         # Retry the member next cycle if the writer is between append/close.
         return [], offset
     return rows, size
+
+
+def onchain_lane_to_fill(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Translate a reconciled on-chain/data-api lane row into follower input."""
+    if row.get("type") != "lane_detection":
+        return None
+    source = str(row.get("source") or "")
+    if source not in {"polygon_onchain", "data_api"}:
+        return None
+    durable_id = str(row.get("durable_trade_id") or "")
+    wallet = str(row.get("wallet") or "").lower()
+    token = str(row.get("token_id") or "")
+    side = side_norm(row.get("side"))
+    detected = row.get("detection_ts") or row.get("detection_epoch") or row.get("ts")
+    filled = row.get("ground_truth_ts") or row.get("ground_truth_epoch")
+    if not durable_id or not wallet or not token or side not in {"BUY", "SELL"} or not filled:
+        return None
+    market_raw = row.get("market")
+    market: dict[str, Any] = market_raw if isinstance(market_raw, dict) else {}
+    condition_id = (
+        market.get("condition_id")
+        or market.get("conditionId")
+        or market.get("condition")
+    )
+    return {
+        "type": "fill",
+        "ts": (parse_ts(detected) or utc_now()).isoformat(),
+        "fill_timestamp": (parse_ts(filled) or utc_now()).isoformat(),
+        "wallet": wallet,
+        "trade_id": durable_id,
+        "fill_side": side,
+        "fill_price": row.get("price"),
+        "detection_source": source,
+        "trade": {
+            "transactionHash": row.get("transaction_hash"),
+            "logIndex": row.get("log_index"),
+            "asset": token,
+            "side": side,
+            "price": row.get("price"),
+            "size": row.get("size"),
+            "conditionId": condition_id,
+            "timestamp": (parse_ts(filled) or utc_now()).isoformat(),
+        },
+    }
+
+
+def iter_new_onchain_fills(path: Path, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+    """Tail complete on-chain measurement rows without replaying the log."""
+    if not path.exists():
+        return [], 0
+    size = path.stat().st_size
+    if offset < 0 or offset > size:
+        offset = 0
+    fills: list[dict[str, Any]] = []
+    new_offset = offset
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        while True:
+            start = handle.tell()
+            raw = handle.readline()
+            if not raw:
+                break
+            if not raw.endswith(b"\n"):
+                new_offset = start
+                break
+            new_offset = handle.tell()
+            try:
+                row = json.loads(raw.decode("utf-8"))
+            except Exception:
+                continue
+            fill = onchain_lane_to_fill(row)
+            if fill is not None:
+                fills.append(fill)
+    return fills, new_offset
 
 
 # Only load files modified in the last N seconds (filesystem mtime check)
@@ -646,6 +722,21 @@ class PaperFollowerDaemon:
             self.state["processed_trade_ids"] = [str(r.get("trade_id") or trade_id(r.get("trade") or {})) for r in iter_shadow_fills(self.archive_cfg)]
             save_state(self.cfg.state_path, self.state)
         self._processed_trade_ids = set(map(str, self.state.get("processed_trade_ids", [])))
+        self._onchain_log_path = self.cfg.onchain_log_path or (
+            self.cfg.root / "runs" / "onchain_shadow" / "shadow_onchain.jsonl"
+        )
+        persisted_offset = self.state.get("onchain_log_offset")
+        if persisted_offset is None:
+            # First activation starts at the live tail.  Historical measurement
+            # rows must never become paper entries after a deploy.
+            persisted_offset = (
+                self._onchain_log_path.stat().st_size
+                if self._onchain_log_path.exists()
+                else 0
+            )
+            self.state["onchain_log_offset"] = persisted_offset
+            save_state(self.cfg.state_path, self.state)
+        self._onchain_offset = int(persisted_offset)
         self._shadow_offsets: dict[str, int] = {}
         self._daily_key = ""
         self._accepts_today = 0
@@ -685,6 +776,7 @@ class PaperFollowerDaemon:
             "token": trade.get("asset") or book.get("token_id"),
             "side": row.get("fill_side") or trade.get("side"),
             "detection_latency_s": latency,
+            "detection_source": row.get("detection_source") or "data_api_archive",
             "wallet_fill_price": row.get("fill_price") if row.get("fill_price") is not None else trade.get("price"),
             "sim_fill_price": None,
             "sim_size": None,
@@ -704,7 +796,6 @@ class PaperFollowerDaemon:
         detect_ts = parse_ts(row.get("ts")) or utc_now()
         fill_ts = parse_ts(row.get("fill_timestamp") or trade.get("timestamp"))
         latency = (detect_ts - fill_ts).total_seconds() if fill_ts else None
-        out = [self.signal_row(row, tid, latency)]
         # Backstop BBO: if archive hasn't caught up yet, hit CLOB REST once
         # (cached for 30s by token) so the signal can pass rejection checks
         book = row.get("book_at_detection") if isinstance(row.get("book_at_detection"), dict) else {}
@@ -715,8 +806,11 @@ class PaperFollowerDaemon:
                 row["book_at_detection"] = backstop
                 book = backstop
         book = book or {}
+        # Build the signal after the backstop so the journal captures the actual
+        # detection-time execution evidence rather than an empty snapshot.
+        out = [self.signal_row(row, tid, latency)]
         # Tell the archive daemon to prioritize this token for WS subscription
-        if not row.get("book_at_detection") or row.get("book_at_detection", {}).get("_source") == "rest_backstop":
+        if not row.get("book_at_detection") or row.get("book_at_detection", {}).get("_source") in {"rest_backstop", "clob_rest_live"}:
             _token_for_archive = str(trade.get("asset") or book.get("token_id") or "")
             if _token_for_archive:
                 _flag_token_for_archive_fn(_token_for_archive)
@@ -811,18 +905,19 @@ class PaperFollowerDaemon:
             if heartbeat_ts else float("inf")
         )
         self._cycle_gap_intervals = recent_gap_intervals(self.archive_cfg)
-        # Memory: only load shadow files modified in the last hour (vs. all-time).
-        # Old files (older than 1h) have already been processed before.
-        recent_paths = shadow_paths_recent(self.archive_cfg, since_seconds=3600)
-        for path in recent_paths:
-            key = str(path)
-            fills, new_offset = _iter_new_fills_from_path(
-                path, self._shadow_offsets.get(key, 0)
+        if self.cfg.onchain_primary_enabled:
+            # Polygon is the primary trigger; reconciled Data API lane rows are
+            # fallback.  Both carry the same durable tx:log ID, so one dedup path
+            # covers both lanes.  The legacy raw API archive hot path is disabled
+            # in this mode because its tx-only IDs can double-enter the same fill.
+            fills, new_offset = iter_new_onchain_fills(
+                self._onchain_log_path, self._onchain_offset
             )
             for fill in fills:
+                token = str((fill.get("trade") or {}).get("asset") or "")
+                fill["book_at_detection"] = live_clob_book(token)
                 rows = self.process_fill(fill, accepts_today)
                 if rows:
-                    signal_present = any(r.get("type") == "signal" for r in rows)
                     entry_present = any(r.get("type") == "entry" for r in rows)
                     if entry_present:
                         accepts_today += 1
@@ -833,7 +928,30 @@ class PaperFollowerDaemon:
                     if row.get("type") == "exit":
                         self._pnl_today += num(row.get("pnl"), 0)
                     wrote += 1
-            self._shadow_offsets[key] = new_offset
+            self._onchain_offset = new_offset
+            self.state["onchain_log_offset"] = new_offset
+        else:
+            # Legacy Data API archive follower retained as a fail-safe rollback.
+            recent_paths = shadow_paths_recent(self.archive_cfg, since_seconds=3600)
+            for path in recent_paths:
+                key = str(path)
+                fills, new_offset = _iter_new_fills_from_path(
+                    path, self._shadow_offsets.get(key, 0)
+                )
+                for fill in fills:
+                    rows = self.process_fill(fill, accepts_today)
+                    if rows:
+                        entry_present = any(r.get("type") == "entry" for r in rows)
+                        if entry_present:
+                            accepts_today += 1
+                    for row in rows:
+                        append_jsonl_fsync(self.cfg.ledger_path, row)
+                        if row.get("type") in {"entry", "exit"}:
+                            notify_rows.append(row)
+                        if row.get("type") == "exit":
+                            self._pnl_today += num(row.get("pnl"), 0)
+                        wrote += 1
+                self._shadow_offsets[key] = new_offset
         self._accepts_today = accepts_today
         # Memory: cap processed_trade_ids growth in memory between writes
         ptids = self.state.get("processed_trade_ids", [])
@@ -898,6 +1016,12 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
     entries = [r for r in today_rows if r.get("type") == "entry"]
     rejects = [r for r in today_rows if r.get("type") == "reject"]
     ineligible = [r for r in today_rows if r.get("type") == "ineligible"]
+    signals_by_source = dict(
+        Counter(str(r.get("detection_source") or "legacy") for r in signals)
+    )
+    accepts_by_source = dict(
+        Counter(str(r.get("detection_source") or "legacy") for r in entries)
+    )
     pnl_rows = [r for r in rows if r.get("type") in {"exit", "resolution", "void_correction"}]
     quarantined = quarantined_position_ids(rows, cfg)
     rejects_by_reason: dict[str, int] = {}
@@ -968,6 +1092,9 @@ def paper_status(cfg: PaperConfig | None = None) -> dict[str, Any]:
         "signals_today": len(signals),
         "accepts_today": len(entries),
         "accepts_by_latency": entries_by_latency,
+        "signals_by_source": signals_by_source,
+        "accepts_by_source": accepts_by_source,
+        "onchain_primary_enabled": cfg.onchain_primary_enabled,
         "rejects_today": len(rejects),
         "rejects_by_reason": rejects_by_reason,
         "realized_pnl": round(realized, 4),

@@ -87,20 +87,19 @@ class WalletQualityTest(unittest.TestCase):
     def test_open_positions_from_state(self):
         from polymarket_bot import wallet_quality
         wallet_quality.clear_cache()
-        # Write a state.json with an open position
-        state_path = Path("/root/flip/projects/polymarket-copybot/runs/paper/state.json")
-        orig_state = state_path.read_text() if state_path.exists() else "{}"
-        try:
-            state_path.write_text(json.dumps({
-                "positions": {
-                    "0xwin:T1": {"wallet": "0xwin", "token": "T1", "cost_usd": 100},
-                }
-            }))
-            results = wallet_quality.compute_wallet_quality(ledger_path=self.ledger)
-            w = next(w for w in results if w["wallet"] == "0xwin")
-            self.assertEqual(w["open_positions"], 1)
-        finally:
-            state_path.write_text(orig_state)
+        # Keep tests isolated from the live paper follower state.
+        state_path = Path(self.tmpdir) / "state.json"
+        state_path.write_text(json.dumps({
+            "positions": {
+                "0xwin:T1": {"wallet": "0xwin", "token": "T1", "cost_usd": 100},
+            }
+        }))
+        results = wallet_quality.compute_wallet_quality(
+            ledger_path=self.ledger,
+            state_path=state_path,
+        )
+        w = next(w for w in results if w["wallet"] == "0xwin")
+        self.assertEqual(w["open_positions"], 1)
 
 
 class WalletsQualityEndpointTest(unittest.TestCase):

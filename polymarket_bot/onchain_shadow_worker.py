@@ -64,6 +64,7 @@ class OnchainShadowWorker:
         self.last_wss_message_epoch: float | None = None
         self.connected_since_epoch: float | None = None
         self.disconnected_since_epoch: float | None = None
+        self._wss_provider_index = 0
         self.started_at_epoch = self._load_started_at() or time.time()
         self.api_reader = ApiShadowReader(
             self.config.archive_dir, started_at_epoch=self.started_at_epoch
@@ -435,9 +436,12 @@ class OnchainShadowWorker:
         initial = self.current_head is None
         while self.running:
             connected_at: float | None = None
+            wss_urls = (self.config.wss_rpc_url, *self.config.fallback_wss_rpc_urls)
+            provider_index = self._wss_provider_index % len(wss_urls)
+            wss_url = wss_urls[provider_index]
             try:
                 async with websockets.connect(
-                    self.config.wss_rpc_url,
+                    wss_url,
                     ping_interval=20,
                     ping_timeout=20,
                     open_timeout=20,
@@ -457,6 +461,7 @@ class OnchainShadowWorker:
                             "type": "rpc_connected",
                             "downtime_seconds": downtime,
                             "reconnect": not initial,
+                            "provider_index": provider_index,
                         }
                     )
                     requests_by_id = {
@@ -504,6 +509,9 @@ class OnchainShadowWorker:
                 raise
             except Exception as exc:
                 self.stats["rpc_disconnects"] += 1
+                if len(wss_urls) > 1:
+                    self._wss_provider_index = (provider_index + 1) % len(wss_urls)
+                    self.stats["rpc_provider_failovers"] += 1
                 self.disconnected_since_epoch = time.time()
                 self.connected_since_epoch = None
                 self.log.append(
@@ -515,6 +523,8 @@ class OnchainShadowWorker:
                             if connected_at is not None
                             else 0.0
                         ),
+                        "provider_index": provider_index,
+                        "next_provider_index": self._wss_provider_index,
                     }
                 )
                 LOG.exception("Polygon WSS disconnected; retrying")
@@ -526,8 +536,12 @@ class OnchainShadowWorker:
             payload = {
                 "ts": utc_iso(now),
                 "service": "polymarket-onchain-shadow",
-                "mode": "measurement_only",
-                "paper_follower_integrated": False,
+                "mode": (
+                    "paper_signal_source"
+                    if self.config.paper_follower_integrated
+                    else "measurement_only"
+                ),
+                "paper_follower_integrated": self.config.paper_follower_integrated,
                 "running": self.running,
                 "started_at": utc_iso(self.started_at_epoch),
                 "current_head": self.current_head,
@@ -540,6 +554,8 @@ class OnchainShadowWorker:
                     else None
                 ),
                 "wss_connected": self.connected_since_epoch is not None,
+                "wss_provider_index": self._wss_provider_index,
+                "wss_provider_count": 1 + len(self.config.fallback_wss_rpc_urls),
                 "stats": dict(self.stats),
                 "output_path": str(self.config.output_path),
             }
@@ -559,8 +575,12 @@ class OnchainShadowWorker:
                 {
                     "type": "worker_started",
                     "started_at": utc_iso(self.started_at_epoch),
-                    "mode": "measurement_only",
-                    "paper_follower_integrated": False,
+                    "mode": (
+                        "paper_signal_source"
+                        if self.config.paper_follower_integrated
+                        else "measurement_only"
+                    ),
+                    "paper_follower_integrated": self.config.paper_follower_integrated,
                     "confirmations": self.config.confirmations,
                     "contracts": list(EXCHANGE_ADDRESSES),
                 }

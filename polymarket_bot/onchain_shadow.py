@@ -296,6 +296,8 @@ class OnchainShadowConfig:
     markets_path: Path
     archive_dir: Path
     backfill_chunk_blocks: int = 50
+    fallback_wss_rpc_urls: tuple[str, ...] = ()
+    paper_follower_integrated: bool = False
 
     @classmethod
     def from_env(cls) -> "OnchainShadowConfig":
@@ -340,11 +342,26 @@ class OnchainShadowConfig:
             backfill_chunk_blocks=int(
                 os.getenv("ONCHAIN_BACKFILL_CHUNK_BLOCKS", "50")
             ),
+            fallback_wss_rpc_urls=tuple(
+                url.strip()
+                for url in os.getenv(
+                    "POLYGON_WSS_FALLBACK_URLS", "wss://polygon.drpc.org"
+                ).split(",")
+                if url.strip()
+            ),
+            paper_follower_integrated=os.getenv(
+                "ONCHAIN_PAPER_FOLLOWER_INTEGRATED", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"},
         )
 
     def validate(self) -> None:
         if not self.wss_rpc_url.startswith(("wss://", "ws://")):
             raise ValueError("POLYGON_WSS_RPC_URL must be a websocket URL")
+        if any(
+            not url.startswith(("wss://", "ws://"))
+            for url in self.fallback_wss_rpc_urls
+        ):
+            raise ValueError("POLYGON_WSS_FALLBACK_URLS must contain websocket URLs")
         if not self.http_rpc_url.startswith(("https://", "http://")):
             raise ValueError("POLYGON_HTTP_RPC_URL must be an HTTP URL")
         if self.confirmations < 1:

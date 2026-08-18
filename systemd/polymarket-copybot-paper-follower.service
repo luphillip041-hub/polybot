@@ -2,14 +2,16 @@
 # PAPER ONLY. Public data only. No keys, no orders, no live execution paths.
 [Unit]
 Description=Polymarket Copybot Paper Follower
-After=network-online.target polymarket-copybot-book-archive.service
-Wants=network-online.target
+After=network-online.target polymarket-copybot-book-archive.service polymarket-copybot-onchain-shadow.service
+Wants=network-online.target polymarket-copybot-onchain-shadow.service
 
 [Service]
 Type=simple
 WorkingDirectory=/root/flip/projects/polymarket-copybot
 Environment=PYTHONUNBUFFERED=1
 Environment=POLYMARKET_ARCHIVE_CONFIG=/root/flip/projects/polymarket-copybot/archive_config.json
+Environment=POLYMARKET_ONCHAIN_PRIMARY=true
+Environment=POLYMARKET_ONCHAIN_LOG=/root/flip/projects/polymarket-copybot/runs/onchain_shadow/shadow_onchain.jsonl
 EnvironmentFile=-/root/flip/secrets/copybot_paper_webhook.env
 ExecStart=/usr/bin/python3 -m polymarket_bot.paper_follower
 Restart=always
