@@ -405,10 +405,18 @@ def onchain_lane_to_fill(row: dict[str, Any]) -> dict[str, Any] | None:
         or market.get("conditionId")
         or market.get("condition")
     )
+    source_detection = parse_ts(detected)
+    fill_time = parse_ts(filled)
+    follower_observed = utc_now()
     return {
         "type": "fill",
-        "ts": (parse_ts(detected) or utc_now()).isoformat(),
-        "fill_timestamp": (parse_ts(filled) or utc_now()).isoformat(),
+        # Staleness is measured when the follower actually sees the row.  Using
+        # the worker timestamp here would incorrectly accept a backlog after a
+        # follower outage as if it were still an eight-second-old signal.
+        "ts": follower_observed.isoformat(),
+        "fill_timestamp": (fill_time or follower_observed).isoformat(),
+        "source_detection_ts": source_detection.isoformat() if source_detection else None,
+        "source_detection_latency_s": row.get("detection_latency_seconds"),
         "wallet": wallet,
         "trade_id": durable_id,
         "fill_side": side,
@@ -422,7 +430,7 @@ def onchain_lane_to_fill(row: dict[str, Any]) -> dict[str, Any] | None:
             "price": row.get("price"),
             "size": row.get("size"),
             "conditionId": condition_id,
-            "timestamp": (parse_ts(filled) or utc_now()).isoformat(),
+            "timestamp": (fill_time or follower_observed).isoformat(),
         },
     }
 
@@ -430,7 +438,9 @@ def onchain_lane_to_fill(row: dict[str, Any]) -> dict[str, Any] | None:
 def iter_new_onchain_fills(path: Path, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
     """Tail complete on-chain measurement rows without replaying the log."""
     if not path.exists():
-        return [], 0
+        # A transient missing mount/path must not reset a persisted offset and
+        # replay the entire historical measurement log when it reappears.
+        return [], offset
     size = path.stat().st_size
     if offset < 0 or offset > size:
         offset = 0
@@ -497,6 +507,47 @@ def load_state(path: Path) -> dict[str, Any]:
         data.setdefault("positions", {})
         return data
     return {"processed_trade_ids": [], "positions": {}}
+
+
+def reconcile_state_from_ledger(
+    state: dict[str, Any], ledger_path: Path
+) -> dict[str, Any]:
+    """Recover processed decisions and open positions after an interrupted cycle.
+
+    Ledger rows are append+fsync before the state snapshot.  Rebuilding terminal
+    decisions here closes the crash window without treating a lone `signal` row
+    as complete; a signal-only interrupted decision is safe to retry.
+    """
+    if not ledger_path.exists():
+        return state
+    positions: dict[str, dict[str, Any]] = {}
+    completed_ids: list[str] = []
+    for row in read_jsonl(ledger_path):
+        row_type = row.get("type")
+        trade = row.get("trade") if isinstance(row.get("trade"), dict) else {}
+        tid = str(row.get("trade_id") or (trade_id(trade) if trade else ""))
+        if row_type in {"entry", "exit", "reject", "ineligible"} and tid:
+            completed_ids.append(tid)
+        position_id = str(row.get("position_id") or "")
+        if row_type == "entry" and position_id:
+            price = num(row.get("sim_fill_price"), 0)
+            shares = num(row.get("sim_size"), 0)
+            positions[position_id] = {
+                "position_id": position_id,
+                "wallet": str(row.get("wallet") or "").lower(),
+                "token": str(row.get("token") or ""),
+                "entry_price": price,
+                "shares": shares,
+                "cost_usd": price * shares,
+                "opened_at": row.get("ts"),
+                "quarantined_low_price": bool(row.get("quarantined_low_price")),
+            }
+        elif row_type in {"exit", "resolution"} and position_id:
+            positions.pop(position_id, None)
+    state["positions"] = positions
+    prior = [str(value) for value in state.get("processed_trade_ids", [])]
+    state["processed_trade_ids"] = list(dict.fromkeys(prior + completed_ids))[-20000:]
+    return state
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
@@ -721,6 +772,8 @@ class PaperFollowerDaemon:
             # newly observed fills after service activation.
             self.state["processed_trade_ids"] = [str(r.get("trade_id") or trade_id(r.get("trade") or {})) for r in iter_shadow_fills(self.archive_cfg)]
             save_state(self.cfg.state_path, self.state)
+        self.state = reconcile_state_from_ledger(self.state, self.cfg.ledger_path)
+        save_state(self.cfg.state_path, self.state)
         self._processed_trade_ids = set(map(str, self.state.get("processed_trade_ids", [])))
         self._onchain_log_path = self.cfg.onchain_log_path or (
             self.cfg.root / "runs" / "onchain_shadow" / "shadow_onchain.jsonl"
@@ -776,6 +829,8 @@ class PaperFollowerDaemon:
             "token": trade.get("asset") or book.get("token_id"),
             "side": row.get("fill_side") or trade.get("side"),
             "detection_latency_s": latency,
+            "source_detection_ts": row.get("source_detection_ts"),
+            "source_detection_latency_s": row.get("source_detection_latency_s"),
             "detection_source": row.get("detection_source") or "data_api_archive",
             "wallet_fill_price": row.get("fill_price") if row.get("fill_price") is not None else trade.get("price"),
             "sim_fill_price": None,
