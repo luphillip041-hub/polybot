@@ -130,6 +130,8 @@ def test_onchain_config_loads_fallback_and_integration_flags(monkeypatch) -> Non
         "wss://polygon.drpc.org,wss://backup.example",
     )
     monkeypatch.setenv("ONCHAIN_PAPER_FOLLOWER_INTEGRATED", "true")
+    monkeypatch.setenv("POLYGON_HTTP_FALLBACK_URLS", "https://polygon.drpc.org")
+    monkeypatch.setenv("ONCHAIN_HEAD_STALE_SECONDS", "30")
     cfg = OnchainShadowConfig.from_env()
     cfg.validate()
     assert cfg.fallback_wss_rpc_urls == (
@@ -137,6 +139,8 @@ def test_onchain_config_loads_fallback_and_integration_flags(monkeypatch) -> Non
         "wss://backup.example",
     )
     assert cfg.paper_follower_integrated is True
+    assert cfg.fallback_http_rpc_urls == ("https://polygon.drpc.org",)
+    assert cfg.head_stale_seconds == 30
 
 
 def test_onchain_primary_precedes_and_disables_raw_api_hot_path(tmp_path: Path, monkeypatch) -> None:

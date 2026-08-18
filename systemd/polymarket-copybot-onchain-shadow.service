@@ -14,7 +14,9 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=POLYGON_WSS_RPC_URL=wss://polygon-bor-rpc.publicnode.com
 Environment=POLYGON_WSS_FALLBACK_URLS=wss://polygon.drpc.org
 Environment=POLYGON_HTTP_RPC_URL=https://polygon-bor-rpc.publicnode.com
+Environment=POLYGON_HTTP_FALLBACK_URLS=https://polygon.drpc.org
 Environment=ONCHAIN_CONFIRMATIONS=6
+Environment=ONCHAIN_HEAD_STALE_SECONDS=30
 Environment=ONCHAIN_PAPER_FOLLOWER_INTEGRATED=true
 EnvironmentFile=-/etc/polymarket-copybot-onchain-shadow.env
 ExecStart=/root/flip/projects/polymarket-copybot/.venv/bin/python -m polymarket_bot.onchain_shadow_worker

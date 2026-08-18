@@ -7,6 +7,7 @@ from pathlib import Path
 from polymarket_bot.onchain_measurement import (
     ApiShadowReader,
     MeasurementLog,
+    PolygonHttpRpc,
     coverage_report,
     load_tracked_wallets,
     percentile,
@@ -109,3 +110,31 @@ def test_coverage_report_uses_same_ground_truth_and_counts_axes(tmp_path: Path) 
 def test_percentile_is_linear_and_empty_safe() -> None:
     assert percentile([], 0.9) is None
     assert percentile([1.0, 2.0], 0.5) == 1.5
+
+
+def test_polygon_http_rpc_fails_over_and_caches_blocks() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"result": {"number": "0x7b", "timestamp": "0x1"}}
+
+    calls: list[str] = []
+    rpc = PolygonHttpRpc(
+        "https://primary.invalid",
+        fallback_urls=("https://secondary.invalid",),
+    )
+
+    def post(url: str, **_kwargs):
+        calls.append(url)
+        if url == "https://primary.invalid":
+            raise TimeoutError("primary unavailable")
+        return Response()
+
+    rpc.session.post = post  # type: ignore[method-assign]
+    first = rpc.block(123)
+    second = rpc.block(123)
+    assert first == second == {"number": "0x7b", "timestamp": "0x1"}
+    assert calls == ["https://primary.invalid", "https://secondary.invalid"]
+    assert rpc.url == "https://secondary.invalid"

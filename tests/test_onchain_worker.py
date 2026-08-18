@@ -127,3 +127,17 @@ def test_canonical_hash_mismatch_is_reorg_not_detection(tmp_path: Path) -> None:
     assert rows[-1]["type"] == "reorg_removed"
     assert rows[-1]["reason"] == "canonical_block_hash_mismatch"
     assert all(row["type"] != "lane_detection" for row in rows)
+
+
+def test_new_head_updates_independent_head_watchdog_clock(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    cfg.allowlist_path.write_text(json.dumps({"wallets": [TRACKED]}))
+    worker = OnchainShadowWorker(cfg, rpc=FakeRpc())
+    assert worker.last_head_message_epoch is None
+    asyncio.run(
+        worker._handle_subscription(
+            {"params": {"result": {"number": hex(91_145_438)}}}
+        )
+    )
+    assert worker.last_head_message_epoch is not None
+    assert worker.current_head == 91_145_438

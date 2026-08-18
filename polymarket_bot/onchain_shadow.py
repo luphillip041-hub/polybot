@@ -297,7 +297,9 @@ class OnchainShadowConfig:
     archive_dir: Path
     backfill_chunk_blocks: int = 50
     fallback_wss_rpc_urls: tuple[str, ...] = ()
+    fallback_http_rpc_urls: tuple[str, ...] = ()
     paper_follower_integrated: bool = False
+    head_stale_seconds: float = 45.0
 
     @classmethod
     def from_env(cls) -> "OnchainShadowConfig":
@@ -349,9 +351,19 @@ class OnchainShadowConfig:
                 ).split(",")
                 if url.strip()
             ),
+            fallback_http_rpc_urls=tuple(
+                url.strip()
+                for url in os.getenv(
+                    "POLYGON_HTTP_FALLBACK_URLS", "https://polygon.drpc.org"
+                ).split(",")
+                if url.strip()
+            ),
             paper_follower_integrated=os.getenv(
                 "ONCHAIN_PAPER_FOLLOWER_INTEGRATED", "false"
             ).strip().lower() in {"1", "true", "yes", "on"},
+            head_stale_seconds=float(
+                os.getenv("ONCHAIN_HEAD_STALE_SECONDS", "45")
+            ),
         )
 
     def validate(self) -> None:
@@ -364,9 +376,16 @@ class OnchainShadowConfig:
             raise ValueError("POLYGON_WSS_FALLBACK_URLS must contain websocket URLs")
         if not self.http_rpc_url.startswith(("https://", "http://")):
             raise ValueError("POLYGON_HTTP_RPC_URL must be an HTTP URL")
+        if any(
+            not url.startswith(("https://", "http://"))
+            for url in self.fallback_http_rpc_urls
+        ):
+            raise ValueError("POLYGON_HTTP_FALLBACK_URLS must contain HTTP URLs")
         if self.confirmations < 1:
             raise ValueError("ONCHAIN_CONFIRMATIONS must be at least 1")
         if self.max_backfill_blocks < self.initial_backfill_blocks:
             raise ValueError("max backfill must cover initial backfill")
         if self.backfill_chunk_blocks < 1:
             raise ValueError("backfill chunk size must be positive")
+        if self.head_stale_seconds < 5:
+            raise ValueError("head stale threshold must be at least 5 seconds")

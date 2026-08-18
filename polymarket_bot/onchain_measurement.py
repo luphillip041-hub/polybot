@@ -6,7 +6,7 @@ import gzip
 import json
 import os
 import threading
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -206,25 +206,57 @@ class ApiShadowReader:
 
 
 class PolygonHttpRpc:
-    def __init__(self, url: str, timeout_seconds: float = 30.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        timeout_seconds: float = 10.0,
+        fallback_urls: tuple[str, ...] = (),
+    ) -> None:
+        self.urls = (url, *fallback_urls)
         self.url = url
         self.timeout_seconds = timeout_seconds
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Hermes-Polymarket-Onchain-Shadow/0.1"})
         self._request_id = 0
+        self._provider_index = 0
+        self._id_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._block_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._block_cache_limit = 4096
 
     def call(self, method: str, params: list[Any]) -> Any:
-        self._request_id += 1
-        response = self.session.post(
-            self.url,
-            json={"jsonrpc": "2.0", "id": self._request_id, "method": method, "params": params},
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        body = response.json()
-        if body.get("error"):
-            raise RuntimeError(f"Polygon RPC {method} error: {body['error']}")
-        return body.get("result")
+        last_error: Exception | None = None
+        for attempt in range(len(self.urls)):
+            provider_index = (self._provider_index + attempt) % len(self.urls)
+            url = self.urls[provider_index]
+            try:
+                with self._id_lock:
+                    self._request_id += 1
+                    request_id = self._request_id
+                response = self.session.post(
+                    url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": method,
+                        "params": params,
+                    },
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                body = response.json()
+                if body.get("error"):
+                    raise RuntimeError(
+                        f"Polygon RPC {method} error: {body['error']}"
+                    )
+                self._provider_index = provider_index
+                self.url = url
+                return body.get("result")
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("no Polygon HTTP RPC providers configured")
 
     def latest_block_number(self) -> int:
         return int(self.call("eth_blockNumber", []), 16)
@@ -234,8 +266,20 @@ class PolygonHttpRpc:
         return value if isinstance(value, dict) else None
 
     def block(self, block_number: int) -> dict[str, Any] | None:
+        with self._cache_lock:
+            cached = self._block_cache.get(block_number)
+            if cached is not None:
+                self._block_cache.move_to_end(block_number)
+                return dict(cached)
         value = self.call("eth_getBlockByNumber", [hex(block_number), False])
-        return value if isinstance(value, dict) else None
+        if not isinstance(value, dict):
+            return None
+        with self._cache_lock:
+            self._block_cache[block_number] = dict(value)
+            self._block_cache.move_to_end(block_number)
+            while len(self._block_cache) > self._block_cache_limit:
+                self._block_cache.popitem(last=False)
+        return value
 
     def logs(self, start_block: int, end_block: int) -> list[dict[str, Any]]:
         if end_block < start_block:

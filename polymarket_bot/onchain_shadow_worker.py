@@ -53,7 +53,10 @@ class OnchainShadowWorker:
         self.config = config or OnchainShadowConfig.from_env()
         self.config.validate()
         self.log = MeasurementLog(self.config.output_path)
-        self.rpc = rpc or PolygonHttpRpc(self.config.http_rpc_url)
+        self.rpc = rpc or PolygonHttpRpc(
+            self.config.http_rpc_url,
+            fallback_urls=self.config.fallback_http_rpc_urls,
+        )
         self.metadata = MetadataResolver(self.config.markets_path)
         self.confirmations = ConfirmationBuffer(self.config.confirmations)
         self.stats: Counter[str] = Counter()
@@ -62,6 +65,7 @@ class OnchainShadowWorker:
         self.running = True
         self.current_head: int | None = self._load_last_head()
         self.last_wss_message_epoch: float | None = None
+        self.last_head_message_epoch: float | None = None
         self.connected_since_epoch: float | None = None
         self.disconnected_since_epoch: float | None = None
         self._wss_provider_index = 0
@@ -428,6 +432,7 @@ class OnchainShadowWorker:
             self.ingest_log(result, origin="live")
             return
         if result.get("number") is not None:
+            self.last_head_message_epoch = time.time()
             head = int(result["number"], 16)
             self.current_head = max(head, self.current_head or head)
             await self.finalize_ready(head)
@@ -497,14 +502,25 @@ class OnchainShadowWorker:
                             early_notifications.append(message)
                     latest = await asyncio.to_thread(self.rpc.latest_block_number)
                     await self._backfill(latest, initial=initial)
+                    self.last_head_message_epoch = time.time()
                     initial = False
                     for message in early_notifications:
                         await self._handle_subscription(message)
                     while self.running:
-                        raw = await asyncio.wait_for(websocket.recv(), timeout=45)
+                        raw = await asyncio.wait_for(
+                            websocket.recv(),
+                            timeout=min(45.0, self.config.head_stale_seconds),
+                        )
                         message = json.loads(raw)
                         if message.get("method") == "eth_subscription":
                             await self._handle_subscription(message)
+                        if (
+                            self.last_head_message_epoch is not None
+                            and time.time() - self.last_head_message_epoch
+                            > self.config.head_stale_seconds
+                        ):
+                            self.stats["head_stream_stale_disconnects"] += 1
+                            raise TimeoutError("Polygon newHeads subscription stale")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -514,6 +530,7 @@ class OnchainShadowWorker:
                     self.stats["rpc_provider_failovers"] += 1
                 self.disconnected_since_epoch = time.time()
                 self.connected_since_epoch = None
+                self.last_head_message_epoch = None
                 self.log.append(
                     {
                         "type": "rpc_disconnected",
@@ -551,6 +568,11 @@ class OnchainShadowWorker:
                 "last_wss_message_ts": (
                     utc_iso(self.last_wss_message_epoch)
                     if self.last_wss_message_epoch is not None
+                    else None
+                ),
+                "last_head_message_ts": (
+                    utc_iso(self.last_head_message_epoch)
+                    if self.last_head_message_epoch is not None
                     else None
                 ),
                 "wss_connected": self.connected_since_epoch is not None,
