@@ -381,6 +381,7 @@ class OnchainShadowWorker:
             start = latest - self.config.max_backfill_blocks + 1
         recovered = dropped_blocks == 0
         logs_replayed = 0
+        caught_error: Exception | None = None
         try:
             for chunk_start in range(
                 start, latest + 1, self.config.backfill_chunk_blocks
@@ -395,6 +396,7 @@ class OnchainShadowWorker:
             await self.finalize_ready(latest)
         except Exception as exc:
             recovered = False
+            caught_error = exc
             self.stats["rpc_errors"] += 1
             self.log.append(
                 {
@@ -420,6 +422,12 @@ class OnchainShadowWorker:
         )
         self.stats["rpc_gap_events"] += 1
         self.stats["rpc_gap_blocks"] += requested_blocks
+        if caught_error is not None:
+            # Do not advance past a failed range.  Reconnect and retry from
+            # the previous durable head so transient provider failures cannot
+            # create a permanent blind spot.
+            self.current_head = previous
+            raise caught_error
         self.current_head = latest
 
     async def _handle_subscription(self, payload: dict[str, Any]) -> None:

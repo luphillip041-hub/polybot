@@ -5,6 +5,8 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from polymarket_bot.onchain_measurement import MeasurementLog
 from polymarket_bot.onchain_shadow import MetadataResolver, OnchainShadowConfig
 from polymarket_bot.onchain_shadow_worker import OnchainShadowWorker
@@ -141,3 +143,22 @@ def test_new_head_updates_independent_head_watchdog_clock(tmp_path: Path) -> Non
     )
     assert worker.last_head_message_epoch is not None
     assert worker.current_head == 91_145_438
+
+
+def test_failed_backfill_preserves_previous_head_for_retry(tmp_path: Path) -> None:
+    class FailingBackfillRpc(FakeRpc):
+        def logs(self, _start_block: int, _end_block: int) -> list[dict]:
+            raise RuntimeError("provider unavailable")
+
+    cfg = config(tmp_path)
+    cfg.allowlist_path.write_text(json.dumps({"wallets": [TRACKED]}))
+    worker = OnchainShadowWorker(cfg, rpc=FailingBackfillRpc())
+    worker.current_head = 100
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        asyncio.run(worker._backfill(102, initial=False))
+    assert worker.current_head == 100
+    rows = [json.loads(line) for line in cfg.output_path.read_text().splitlines()]
+    gap = next(row for row in rows if row["type"] == "rpc_gap")
+    assert gap["from_block"] == 101
+    assert gap["to_block"] == 102
+    assert gap["recovered"] is False

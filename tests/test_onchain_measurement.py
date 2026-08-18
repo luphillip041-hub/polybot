@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
+import time
 from pathlib import Path
 
 from polymarket_bot.onchain_measurement import (
@@ -138,3 +140,36 @@ def test_polygon_http_rpc_fails_over_and_caches_blocks() -> None:
     assert first == second == {"number": "0x7b", "timestamp": "0x1"}
     assert calls == ["https://primary.invalid", "https://secondary.invalid"]
     assert rpc.url == "https://secondary.invalid"
+
+
+def test_polygon_http_rpc_serializes_shared_session_calls() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"result": "0x7b"}
+
+    rpc = PolygonHttpRpc("https://provider.invalid")
+    state = {"active": 0, "max_active": 0}
+    state_lock = threading.Lock()
+
+    def post(_url: str, **_kwargs):
+        with state_lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+        time.sleep(0.03)
+        with state_lock:
+            state["active"] -= 1
+        return Response()
+
+    rpc.session.post = post  # type: ignore[method-assign]
+    threads = [
+        threading.Thread(target=rpc.latest_block_number)
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert state["max_active"] == 1

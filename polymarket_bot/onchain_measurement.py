@@ -220,6 +220,7 @@ class PolygonHttpRpc:
         self._request_id = 0
         self._provider_index = 0
         self._id_lock = threading.Lock()
+        self._session_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         self._block_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self._block_cache_limit = 4096
@@ -233,18 +234,22 @@ class PolygonHttpRpc:
                 with self._id_lock:
                     self._request_id += 1
                     request_id = self._request_id
-                response = self.session.post(
-                    url,
-                    json={
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "method": method,
-                        "params": params,
-                    },
-                    timeout=self.timeout_seconds,
-                )
-                response.raise_for_status()
-                body = response.json()
+                # requests.Session is not thread-safe.  The websocket lane
+                # and Data API reconciliation lane both call through
+                # asyncio.to_thread, so serialize the shared transport.
+                with self._session_lock:
+                    response = self.session.post(
+                        url,
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "method": method,
+                            "params": params,
+                        },
+                        timeout=self.timeout_seconds,
+                    )
+                    response.raise_for_status()
+                    body = response.json()
                 if body.get("error"):
                     raise RuntimeError(
                         f"Polygon RPC {method} error: {body['error']}"
