@@ -142,6 +142,60 @@ def test_polygon_http_rpc_fails_over_and_caches_blocks() -> None:
     assert rpc.url == "https://secondary.invalid"
 
 
+def test_polygon_http_rpc_block_cache_strips_unused_fields() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "result": {
+                    "number": "0x7b",
+                    "hash": "0xabc",
+                    "timestamp": "0x1",
+                    "transactions": ["0x" + "11" * 32] * 500,
+                    "extra": "x" * 10000,
+                }
+            }
+
+    rpc = PolygonHttpRpc("https://provider.invalid")
+    rpc.session.post = lambda *a, **k: Response()  # type: ignore[method-assign]
+    block = rpc.block(123)
+    assert block == {"number": "0x7b", "hash": "0xabc", "timestamp": "0x1"}
+    cached = rpc._block_cache[123]
+    assert "transactions" not in cached
+    assert "extra" not in cached
+
+
+def test_measurement_log_loads_only_recent_dedup_window(tmp_path: Path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    path = tmp_path / "shadow.jsonl"
+    now = datetime.now(UTC)
+    old_ts = (now - timedelta(days=10)).isoformat(timespec="milliseconds")
+    new_ts = now.isoformat(timespec="milliseconds")
+    rows = [
+        {"type": "lane_detection", "source": "polygon_onchain",
+         "durable_trade_id": "0xold:1", "ts": old_ts},
+        {"type": "lane_detection", "source": "data_api",
+         "durable_trade_id": "0xold:1", "ts": old_ts,
+         "api_observation_key": "oldkey"},
+        {"type": "lane_detection", "source": "polygon_onchain",
+         "durable_trade_id": "0xnew:2", "ts": new_ts},
+        {"type": "lane_detection", "source": "data_api",
+         "durable_trade_id": "0xnew:2", "ts": new_ts,
+         "api_observation_key": "newkey"},
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    log = MeasurementLog(path)
+    assert ("polygon_onchain", "0xnew:2") in log.seen_lane_ids
+    assert "0xnew:2" in log.seen_onchain_event_ids
+    assert "newkey" in log.seen_api_observations
+    assert ("polygon_onchain", "0xold:1") not in log.seen_lane_ids
+    assert "0xold:1" not in log.seen_onchain_event_ids
+    assert "oldkey" not in log.seen_api_observations
+
+
 def test_polygon_http_rpc_serializes_shared_session_calls() -> None:
     class Response:
         def raise_for_status(self) -> None:

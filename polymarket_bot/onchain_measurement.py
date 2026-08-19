@@ -74,43 +74,124 @@ def load_tracked_wallets(path: Path) -> set[str]:
 class MeasurementLog:
     """Append-only shadow log with restart-time dedup reconstruction."""
 
-    def __init__(self, path: Path) -> None:
+    # Dedup only needs to cover reconnect/backfill overlap (minutes) and the
+    # Data API fallback window (~1h).  48h is far beyond both; loading the
+    # full multi-week history cost ~450MB RSS at startup.
+    DEFAULT_DEDUP_WINDOW_SECONDS = 48 * 3600
+
+    def __init__(self, path: Path, dedup_window_seconds: float | None = None) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.seen_lane_ids: set[tuple[str, str]] = set()
         self.seen_onchain_event_ids: set[str] = set()
         self.seen_api_observations: set[str] = set()
+        self.dedup_window_seconds = (
+            dedup_window_seconds
+            if dedup_window_seconds is not None
+            else float(
+                os.getenv(
+                    "ONCHAIN_DEDUP_WINDOW_SECONDS",
+                    str(self.DEFAULT_DEDUP_WINDOW_SECONDS),
+                )
+            )
+        )
         self._load_seen()
 
     def _load_seen(self) -> None:
         if not self.path.exists():
             return
+        cutoff = datetime.now(UTC).timestamp() - self.dedup_window_seconds
+        for row in self._iter_recent_rows(cutoff):
+            self._index_row(row)
+
+    def _iter_recent_rows(self, cutoff: float) -> Iterable[dict[str, Any]]:
+        """Yield rows newer than cutoff, reading the append-only log tail-first.
+
+        Rows are appended in time order, so once a parseable row older than
+        the cutoff appears after newer rows, the rest of the file is skipped.
+        Rows without usable timestamps are kept (safe side for dedup).
+        """
         try:
-            with self.path.open() as handle:
-                for line in handle:
-                    try:
-                        row = json.loads(line)
-                    except (ValueError, TypeError):
-                        continue
-                    if row.get("type") == "lane_detection":
-                        source = str(row.get("source") or "")
-                        trade_id = str(row.get("durable_trade_id") or "")
-                        if source and trade_id:
-                            self.seen_lane_ids.add((source, trade_id))
-                            if source == "polygon_onchain":
-                                self.seen_onchain_event_ids.add(trade_id)
-                    if row.get("type") == "pre_window_event" and row.get(
-                        "source"
-                    ) == "polygon_onchain":
-                        trade_id = str(row.get("durable_trade_id") or "")
-                        if trade_id:
-                            self.seen_onchain_event_ids.add(trade_id)
-                    api_key = row.get("api_observation_key")
-                    if api_key:
-                        self.seen_api_observations.add(str(api_key))
+            size = self.path.stat().st_size
         except OSError:
             return
+        chunk = 8 * 1024 * 1024
+        tail_lines: list[bytes] = []  # newest first, complete lines only
+        try:
+            with self.path.open("rb") as handle:
+                pos = size
+                pending = b""  # partial oldest line carried from newer chunks
+                while pos > 0:
+                    read_size = min(chunk, pos)
+                    pos -= read_size
+                    handle.seek(pos)
+                    combined = handle.read(read_size) + pending
+                    lines = combined.split(b"\n")
+                    if pos > 0:
+                        # lines[0] is partial: its head lives in the next chunk.
+                        tail_lines[len(tail_lines):] = reversed(lines[1:])
+                        pending = lines[0]
+                    else:
+                        tail_lines[len(tail_lines):] = reversed(lines)
+                        pending = b""
+                    # Decide whether the window boundary is inside what we have.
+                    seen_newer = False
+                    boundary = False
+                    for raw in tail_lines:
+                        if not raw.strip():
+                            continue
+                        try:
+                            row = json.loads(raw)
+                        except ValueError:
+                            continue
+                        if not isinstance(row, dict):
+                            continue
+                        ts = parse_epoch(row.get("ts"))
+                        if ts is None:
+                            continue
+                        if ts < cutoff:
+                            if seen_newer:
+                                boundary = True
+                                break
+                            continue
+                        seen_newer = True
+                    if boundary or pos == 0:
+                        break
+        except OSError:
+            return
+        for raw in reversed(tail_lines):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            ts = parse_epoch(row.get("ts"))
+            if ts is not None and ts < cutoff:
+                continue
+            yield row
+
+    def _index_row(self, row: dict[str, Any]) -> None:
+        if row.get("type") == "lane_detection":
+            source = str(row.get("source") or "")
+            trade_id = str(row.get("durable_trade_id") or "")
+            if source and trade_id:
+                self.seen_lane_ids.add((source, trade_id))
+                if source == "polygon_onchain":
+                    self.seen_onchain_event_ids.add(trade_id)
+        if (
+            row.get("type") == "pre_window_event"
+            and row.get("source") == "polygon_onchain"
+        ):
+            trade_id = str(row.get("durable_trade_id") or "")
+            if trade_id:
+                self.seen_onchain_event_ids.add(trade_id)
+        api_key = row.get("api_observation_key")
+        if api_key:
+            self.seen_api_observations.add(str(api_key))
 
     def append(self, row: dict[str, Any]) -> None:
         payload = dict(row)
@@ -270,6 +351,11 @@ class PolygonHttpRpc:
         value = self.call("eth_getTransactionReceipt", [transaction_hash])
         return value if isinstance(value, dict) else None
 
+    # Only the fields callers actually use.  Caching full block dicts
+    # (header + every tx hash) cost ~30KB per entry; 4096 of them was
+    # hundreds of MB of RSS for nothing.
+    _SLIM_BLOCK_KEYS = ("number", "hash", "timestamp")
+
     def block(self, block_number: int) -> dict[str, Any] | None:
         with self._cache_lock:
             cached = self._block_cache.get(block_number)
@@ -279,12 +365,13 @@ class PolygonHttpRpc:
         value = self.call("eth_getBlockByNumber", [hex(block_number), False])
         if not isinstance(value, dict):
             return None
+        slim = {k: value[k] for k in self._SLIM_BLOCK_KEYS if k in value}
         with self._cache_lock:
-            self._block_cache[block_number] = dict(value)
+            self._block_cache[block_number] = slim
             self._block_cache.move_to_end(block_number)
             while len(self._block_cache) > self._block_cache_limit:
                 self._block_cache.popitem(last=False)
-        return value
+        return dict(slim)
 
     def logs(self, start_block: int, end_block: int) -> list[dict[str, Any]]:
         if end_block < start_block:

@@ -12,6 +12,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=POLYMARKET_ARCHIVE_CONFIG=/root/flip/projects/polymarket-copybot/archive_config.json
 Environment=POLYMARKET_ONCHAIN_PRIMARY=true
 Environment=POLYMARKET_ONCHAIN_LOG=/root/flip/projects/polymarket-copybot/runs/onchain_shadow/shadow_onchain.jsonl
+Environment=PAPER_MAX_SIGNALS_PER_DAY=300
 EnvironmentFile=-/root/flip/secrets/copybot_paper_webhook.env
 ExecStart=/usr/bin/python3 -m polymarket_bot.paper_follower
 Restart=always
