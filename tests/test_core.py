@@ -504,6 +504,9 @@ class CoreTests(unittest.TestCase):
             paper = root / "paper"
             archive.mkdir(); paper.mkdir()
             cfg = PaperConfig(paper_dir=paper, ledger_path=paper / "ledger.jsonl", state_path=paper / "state.json", allowlist_path=paper / "allowlist.json", data_quality_path=paper / "data_quality.json", max_ws_age_seconds=999999999, max_signals_per_day=2)
+            # This test exercises the hard daily cap, not the quality ratchet
+            # (which would kick in at 50% utilization of this tiny cap).
+            cfg.score_ratchet_enabled = False
             cfg.allowlist_path.write_text(json.dumps({"wallets": ["0xw"]}))
             acfg = ArchiveConfig(archive_dir=archive, state_path=root / "shadow_state.json", followup_queue_path=archive / "followups.json")
             daemon = PaperFollowerDaemon(cfg, acfg)

@@ -44,6 +44,12 @@ class PaperConfig:
     stale_fill_seconds: float = field(
         default_factory=lambda: float(os.getenv("STALE_FILL_SECONDS", "120"))
     )
+    score_ratchet_enabled: bool = os.getenv(
+        "PAPER_SCORE_RATCHET", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    wallet_scores_refresh_seconds: float = float(
+        os.getenv("PAPER_WALLET_SCORES_REFRESH_SECONDS", "900")
+    )
     max_ws_age_seconds: float = 60.0
     haircut: float = 0.005
     poll_interval_seconds: float = 3.0
@@ -154,6 +160,28 @@ def num(value: Any, default: float = 0.0) -> float:
 
 def side_norm(value: Any) -> str:
     return str(value or "").upper()
+
+
+# Daily-cap ratchet: as the day's entry budget fills, raise the minimum wallet
+# quality score so late-day slots go to the historically best leaders instead
+# of first-come-first-served.  (utilization upper bound -> minimum score)
+RATCHET_STEPS: tuple[tuple[float, float], ...] = (
+    (0.50, 0.0),
+    (0.75, 40.0),
+    (0.90, 60.0),
+    (float("inf"), 80.0),
+)
+
+
+def ratchet_min_score(accepts_today: int, max_signals_per_day: int) -> float:
+    """Minimum wallet quality score required at the current cap utilization."""
+    if max_signals_per_day <= 0:
+        return 0.0
+    utilization = accepts_today / max_signals_per_day
+    for bound, score in RATCHET_STEPS:
+        if utilization < bound:
+            return score
+    return RATCHET_STEPS[-1][1]
 
 
 def wallet_name_map() -> dict[str, str]:
@@ -797,6 +825,9 @@ class PaperFollowerDaemon:
         self._cycle_ws_age_seconds: float | None = None
         self._cycle_gap_intervals: list[tuple[datetime, datetime]] = []
         self._refresh_daily_counters(force=True)
+        self._wallet_scores: dict[str, float] = {}
+        self._wallet_scores_at = 0.0
+        self._refresh_wallet_scores(force=True)
         self.running = True
         self._last_resolution_at = time.time()
         self._resolution_summary: dict[str, Any] = {"last_checked_at": None, "checked": 0, "resolved": 0, "skipped": 0}
@@ -817,6 +848,33 @@ class PaperFollowerDaemon:
             if r.get("type") in {"exit", "resolution", "void_correction"}
             and str(r.get("position_id") or "") not in quarantined
         )
+
+    def _refresh_wallet_scores(self, *, force: bool = False) -> None:
+        """Refresh wallet -> quality_score from our own ledger outcomes.
+
+        TTL-gated; a full ledger scan costs a couple seconds so it runs at
+        most every cfg.wallet_scores_refresh_seconds.  On failure the
+        previous map is kept (fail-open toward existing behavior).
+        """
+        if not self.cfg.score_ratchet_enabled:
+            return
+        now = time.time()
+        if not force and now - self._wallet_scores_at < self.cfg.wallet_scores_refresh_seconds:
+            return
+        try:
+            from .wallet_quality import compute_wallet_quality
+
+            rows = compute_wallet_quality(
+                ledger_path=self.cfg.ledger_path,
+                state_path=self.cfg.state_path,
+            )
+            self._wallet_scores = {
+                str(r.get("wallet") or "").lower(): num(r.get("quality_score"), 0.0)
+                for r in rows
+            }
+            self._wallet_scores_at = now
+        except Exception:
+            LOG.exception("wallet score refresh failed; keeping previous scores")
 
     def signal_row(self, row: dict[str, Any], tid: str, latency: float | None) -> dict[str, Any]:
         trade = row.get("trade") if isinstance(row.get("trade"), dict) else {}
@@ -910,15 +968,27 @@ class PaperFollowerDaemon:
                 ex = dict(out[0]); ex.update({"ts": iso_now(), "type": "exit", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "pnl": pnl, "book_snapshot": snap, "quarantined_low_price": bool(pos.get("quarantined_low_price"))})
             out.append(ex)
         else:
-            price, shares, fill_err = simulate_fill(book, "BUY", self.cfg.stake_usd, self.cfg.haircut)
-            if fill_err:
-                ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "reject", "reject_reason": fill_err, "book_snapshot": snap})
-                out.append(ent)
+            min_score = (
+                ratchet_min_score(accepts_today, self.cfg.max_signals_per_day)
+                if self.cfg.score_ratchet_enabled
+                else 0.0
+            )
+            quality = self._wallet_scores.get(wallet, 0.0)
+            out[0]["quality_score"] = quality
+            out[0]["ratchet_min_score"] = min_score
+            if quality < min_score:
+                rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": "score_below_ratchet", "book_snapshot": snap})
+                out.append(rej)
             else:
-                pos_id = position_key(wallet, token)
-                self.state.setdefault("positions", {})[pos_id] = {"position_id": pos_id, "wallet": wallet, "token": token, "entry_price": price, "shares": shares, "cost_usd": self.cfg.stake_usd, "opened_at": iso_now(), "quarantined_low_price": quarantined_low_price}
-                ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "entry", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "book_snapshot": snap, "quarantined_low_price": quarantined_low_price})
-                out.append(ent)
+                price, shares, fill_err = simulate_fill(book, "BUY", self.cfg.stake_usd, self.cfg.haircut)
+                if fill_err:
+                    ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "reject", "reject_reason": fill_err, "book_snapshot": snap})
+                    out.append(ent)
+                else:
+                    pos_id = position_key(wallet, token)
+                    self.state.setdefault("positions", {})[pos_id] = {"position_id": pos_id, "wallet": wallet, "token": token, "entry_price": price, "shares": shares, "cost_usd": self.cfg.stake_usd, "opened_at": iso_now(), "quarantined_low_price": quarantined_low_price}
+                    ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "entry", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "book_snapshot": snap, "quarantined_low_price": quarantined_low_price})
+                    out.append(ent)
         self.state.setdefault("processed_trade_ids", []).append(tid)
         self.state["processed_trade_ids"] = list(dict.fromkeys(self.state["processed_trade_ids"]))[-20000:]
         self._processed_trade_ids.add(tid)
@@ -930,6 +1000,7 @@ class PaperFollowerDaemon:
 
     def process_once(self) -> int:
         self._refresh_daily_counters()
+        self._refresh_wallet_scores()
         # Auto-pause: kill switch file
         if (Path("/root/flip/projects/polymarket-copybot/optsig-paper.disabled")).exists():
             LOG.info("Paper trading paused (kill switch exists). Skipping cycle.")
