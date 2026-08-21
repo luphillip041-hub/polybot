@@ -47,6 +47,12 @@ class PaperConfig:
     score_ratchet_enabled: bool = os.getenv(
         "PAPER_SCORE_RATCHET", "true"
     ).strip().lower() not in {"0", "false", "no", "off"}
+    fill_shadow_enabled: bool = os.getenv(
+        "PAPER_FILL_SHADOW", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    live_quotes_enabled: bool = os.getenv(
+        "PAPER_LIVE_QUOTES", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
     wallet_scores_refresh_seconds: float = float(
         os.getenv("PAPER_WALLET_SCORES_REFRESH_SECONDS", "900")
     )
@@ -828,6 +834,22 @@ class PaperFollowerDaemon:
         self._wallet_scores: dict[str, float] = {}
         self._wallet_scores_at = 0.0
         self._refresh_wallet_scores(force=True)
+        from .fill_shadow import FillShadow
+        from .live_executor import QuoteOnlyExecutor
+
+        self._fill_shadow = FillShadow(
+            self.cfg.paper_dir / "fill_shadow_pending.json",
+            book_fetcher=lambda token: live_clob_book(token, use_cache=False),
+            fill_simulator=simulate_fill,
+            haircut=self.cfg.haircut,
+            stake_usd=self.cfg.stake_usd,
+            enabled=self.cfg.fill_shadow_enabled,
+        )
+        self._executor = (
+            QuoteOnlyExecutor(self.cfg.paper_dir / "live_quotes.jsonl")
+            if self.cfg.live_quotes_enabled
+            else None
+        )
         self.running = True
         self._last_resolution_at = time.time()
         self._resolution_summary: dict[str, Any] = {"last_checked_at": None, "checked": 0, "resolved": 0, "skipped": 0}
@@ -989,6 +1011,12 @@ class PaperFollowerDaemon:
                     self.state.setdefault("positions", {})[pos_id] = {"position_id": pos_id, "wallet": wallet, "token": token, "entry_price": price, "shares": shares, "cost_usd": self.cfg.stake_usd, "opened_at": iso_now(), "quarantined_low_price": quarantined_low_price}
                     ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "entry", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "book_snapshot": snap, "quarantined_low_price": quarantined_low_price})
                     out.append(ent)
+                    self._fill_shadow.schedule(ent)
+                    if self._executor is not None:
+                        try:
+                            self._executor.on_entry(ent, self.cfg.stake_usd)
+                        except Exception:
+                            LOG.exception("quote-only executor failed for %s", ent.get("trade_id"))
         self.state.setdefault("processed_trade_ids", []).append(tid)
         self.state["processed_trade_ids"] = list(dict.fromkeys(self.state["processed_trade_ids"]))[-20000:]
         self._processed_trade_ids.add(tid)
@@ -1079,6 +1107,9 @@ class PaperFollowerDaemon:
                         wrote += 1
                 self._shadow_offsets[key] = new_offset
         self._accepts_today = accepts_today
+        for check_row in self._fill_shadow.run_due():
+            append_jsonl_fsync(self.cfg.ledger_path, check_row)
+            wrote += 1
         # Memory: cap processed_trade_ids growth in memory between writes
         ptids = self.state.get("processed_trade_ids", [])
         if len(ptids) > MAX_PROCESSED_TRADE_IDS_INMEM:
