@@ -134,7 +134,7 @@ def window_stats(rows: list[dict]) -> dict:
     }
 
 
-def bars(alltime: dict) -> list[dict]:
+def bars(alltime: dict, recent: dict | None = None) -> list[dict]:
     out = []
 
     def add(name: str, passed: bool | None, detail: str) -> None:
@@ -148,11 +148,15 @@ def bars(alltime: dict) -> list[dict]:
     add(f"p50 <= {BAR_P50}s", p50 is not None and p50 <= BAR_P50, f"p50={p50}s")
     p90 = alltime["latency_p90_s"]
     add(f"p90 <= {BAR_P90}s", p90 is not None and p90 <= BAR_P90, f"p90={p90}s")
-    sp = alltime["stale_live_pct_of_signals"]
+    # Staleness is gated on the trailing window, not all-time: early-era rows
+    # predate the origin classification and would fail the bar forever.
+    stale_source = recent if recent is not None else alltime
+    window_label = "72h" if recent is not None else "all-time"
+    sp = stale_source["stale_live_pct_of_signals"]
     add(
-        f"stale_fill < {BAR_STALE_PCT}% of signals (recovery-excluded)",
+        f"stale_fill < {BAR_STALE_PCT}% of signals ({window_label}, recovery-excluded)",
         sp is not None and sp < BAR_STALE_PCT,
-        f"stale_fill={sp}% (stale_recovery={alltime['stale_recovery']} rows not gated)",
+        f"stale_fill={sp}% over {window_label} (all-time {alltime['stale_live_pct_of_signals']}%, stale_recovery rows not gated)",
     )
     fc = alltime["fill_checks"].get(BAR_ATTAIN_OFFSET)
     if fc is None or fc["attainable"] + fc["missed"] < BAR_ATTAIN_MIN_SAMPLES:
@@ -235,9 +239,15 @@ def main() -> int:
         if day_key == day:
             day_rows.append(row)
 
+    import datetime as _dt
+
+    cutoff = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M")
+    recent_rows = [r for r in all_rows if str(r.get("ts") or r.get("entry_ts") or "") >= cutoff]
+
     day_stats = window_stats(day_rows)
     alltime = window_stats(all_rows)
-    bar_rows = bars(alltime)
+    recent_stats = window_stats(recent_rows)
+    bar_rows = bars(alltime, recent_stats)
 
     if args.json:
         print(
