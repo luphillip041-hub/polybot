@@ -179,21 +179,32 @@ class CleanupTest(unittest.TestCase):
         # Create a large ledger
         (self.runs_dir / "paper").mkdir(exist_ok=True)
         ledger = self.runs_dir / "paper" / "ledger.jsonl"
-        # 60MB of lines (above 50MB threshold)
-        with open(ledger, "w") as f:
-            for i in range(500_000):
-                f.write(json.dumps({"i": i, "data": "x" * 100}) + "\n")
-        result = self.cleanup.run_cleanup(
-            runs_dir=self.runs_dir,
-            book_retention_days=999,
-            shadow_retention_days=999,
-            max_gb=10.0,
-            dry_run=False,
-        )
+        # Above the rotation threshold (monkeypatched small for speed)
+        original_threshold = self.cleanup.LEDGER_ROTATE_BYTES
+        self.cleanup.LEDGER_ROTATE_BYTES = 1024
+        try:
+            rows = [{"i": i, "data": "x" * 100} for i in range(50)]
+            with open(ledger, "w") as f:
+                for row in rows:
+                    f.write(json.dumps(row) + "\n")
+            result = self.cleanup.run_cleanup(
+                runs_dir=self.runs_dir,
+                book_retention_days=999,
+                shadow_retention_days=999,
+                max_gb=10.0,
+                dry_run=False,
+            )
+        finally:
+            self.cleanup.LEDGER_ROTATE_BYTES = original_threshold
         self.assertTrue(result.ledger_trimmed)
-        # Ledger should be smaller now
-        new_size = ledger.stat().st_size
-        self.assertLess(new_size, 50 * 1024 * 1024)
+        # Rotation is NON-destructive: every row survives in a gzipped segment.
+        import gzip as _gzip
+
+        segments = list((self.runs_dir / "paper" / "ledger_archive").glob("ledger-*.jsonl.gz"))
+        self.assertEqual(len(segments), 1)
+        with _gzip.open(segments[0], "rt") as f:
+            archived = [json.loads(line) for line in f if line.strip()]
+        self.assertEqual(archived, rows)
 
     def test_returns_result_dict(self):
         result = self.cleanup.run_cleanup(

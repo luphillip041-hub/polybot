@@ -98,7 +98,7 @@ def test_confirmation_buffer_finalizes_and_records_removed_reorg() -> None:
     buf = ConfirmationBuffer(confirmations=3)
     buf.add(fill)
     assert buf.finalizable(fill.block_number + 2) == []
-    assert buf.finalizable(fill.block_number + 3) == [fill]
+    assert buf.finalizable(fill.block_number + 3) == [(fill, "live")]
     buf.add(fill)
     removed = buf.remove(fill.durable_trade_id)
     assert removed == fill

@@ -115,6 +115,7 @@ def compute_wallet_quality(
     *,
     state_path: Path | None = None,
     scores_path: Path | None = None,
+    ledger_paths: list[Path] | None = None,
 ) -> list[dict[str, Any]]:
     """Compute quality scores for all wallets in the ledger.
 
@@ -122,12 +123,13 @@ def compute_wallet_quality(
     """
     ledger_path = ledger_path or CONFIG.runs_dir / "paper" / "ledger.jsonl"
     state_path = state_path or CONFIG.runs_dir / "paper" / "state.json"
-    cache_key = f"quality_{ledger_path}"
+    paths_to_read = ledger_paths if ledger_paths else [ledger_path]
+    cache_key = f"quality_{[str(p) for p in paths_to_read]}"
     now = time.time()
     if cache_key in _cache and (now - _cache[cache_key][0]) < CACHE_TTL:
         return _cache[cache_key][1]
 
-    if not ledger_path.exists():
+    if not any(p.exists() for p in paths_to_read):
         return []
 
     name_map = _wallet_name_map(scores_path)
@@ -136,53 +138,59 @@ def compute_wallet_quality(
     # Track entry→exit pairs for holding period
     open_entries: dict[tuple[str, str], datetime] = {}  # (wallet, token) -> entry_ts
 
+    import gzip as _gzip
+
     try:
-        with open(ledger_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                wallet = (row.get("source_wallet") or row.get("wallet") or "").lower()
-                if not wallet:
-                    continue
-                if wallet not in stats_map:
-                    stats_map[wallet] = WalletStats(
-                        wallet=wallet,
-                        name=name_map.get(wallet, wallet[:14] + "…"),
-                    )
-                s = stats_map[wallet]
-                row_type = row.get("type", "")
-                ts = _parse_ts(row.get("ts") or "")
-                if ts:
-                    s.last_seen_at = max(s.last_seen_at, ts.isoformat())
-                if row_type == "signal":
-                    s.signals += 1
-                elif row_type == "entry":
-                    s.accepts += 1
-                    cost = float(row.get("sim_fill_price") or 0) * float(row.get("sim_size") or 0)
-                    s.total_cost += cost
-                    token = row.get("token", "")
-                    if token and ts:
-                        open_entries[(wallet, token)] = ts
-                elif row_type in ("exit", "resolution"):
-                    s.exits += 1
-                    pnl = float(row.get("pnl") or 0)
-                    s.realized_pnl += pnl
-                    if pnl > 0:
-                        s.wins += 1
-                    token = row.get("token", "")
-                    if token:
-                        entry_ts = open_entries.pop((wallet, token), None)
-                        if entry_ts and ts:
-                            holding = (ts - entry_ts).total_seconds() / 3600
-                            s.exits_with_holding += 1
-                            # Running average over matched entry/exit pairs only.
-                            n = s.exits_with_holding
-                            s.avg_holding_hours = (s.avg_holding_hours * (n - 1) + holding) / n
+        for read_path in paths_to_read:
+            if not read_path.exists():
+                continue
+            _opener = _gzip.open if read_path.name.endswith(".gz") else open
+            with _opener(read_path, "rt", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    wallet = (row.get("source_wallet") or row.get("wallet") or "").lower()
+                    if not wallet:
+                        continue
+                    if wallet not in stats_map:
+                        stats_map[wallet] = WalletStats(
+                            wallet=wallet,
+                            name=name_map.get(wallet, wallet[:14] + "…"),
+                        )
+                    s = stats_map[wallet]
+                    row_type = row.get("type", "")
+                    ts = _parse_ts(row.get("ts") or "")
+                    if ts:
+                        s.last_seen_at = max(s.last_seen_at, ts.isoformat())
+                    if row_type == "signal":
+                        s.signals += 1
+                    elif row_type == "entry":
+                        s.accepts += 1
+                        cost = float(row.get("sim_fill_price") or 0) * float(row.get("sim_size") or 0)
+                        s.total_cost += cost
+                        token = row.get("token", "")
+                        if token and ts:
+                            open_entries[(wallet, token)] = ts
+                    elif row_type in ("exit", "resolution"):
+                        s.exits += 1
+                        pnl = float(row.get("pnl") or 0)
+                        s.realized_pnl += pnl
+                        if pnl > 0:
+                            s.wins += 1
+                        token = row.get("token", "")
+                        if token:
+                            entry_ts = open_entries.pop((wallet, token), None)
+                            if entry_ts and ts:
+                                holding = (ts - entry_ts).total_seconds() / 3600
+                                s.exits_with_holding += 1
+                                # Running average over matched entry/exit pairs only.
+                                n = s.exits_with_holding
+                                s.avg_holding_hours = (s.avg_holding_hours * (n - 1) + holding) / n
     except Exception as e:
         logger.exception("ledger read error: %s", e)
 

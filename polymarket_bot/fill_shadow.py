@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-DEFAULT_OFFSETS_SECONDS = (60, 300)
+DEFAULT_OFFSETS_SECONDS = (12, 60, 300)
 
 
 class FillShadow:
@@ -100,6 +100,25 @@ class FillShadow:
                 if offset in done:
                     continue
                 if now < float(pending["entry_epoch"]) + offset:
+                    continue
+                if now > float(pending["entry_epoch"]) + offset + max(120.0, float(offset)):
+                    # Too late to measure honestly (e.g. daemon was down when
+                    # the check came due).  Record the miss instead of a bogus
+                    # drift reading off a hours-stale comparison.
+                    rows.append(
+                        {
+                            "type": "fill_check",
+                            "trade_id": pending["trade_id"],
+                            "token": str(pending["token"]),
+                            "offset_s": offset,
+                            "sim_fill_price": float(pending["sim_fill_price"]),
+                            "entry_ts": pending.get("entry_ts"),
+                            "check_epoch": now,
+                            "attainable": None,
+                            "error": "missed_window",
+                        }
+                    )
+                    done.add(offset)
                     continue
                 rows.append(self._check(pending, offset, now))
                 done.add(offset)

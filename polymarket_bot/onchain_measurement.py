@@ -429,6 +429,7 @@ def lane_detection_row(
     market: dict[str, Any] | None,
     confirmations: int | None = None,
     api_observation_key: str | None = None,
+    origin: str | None = None,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "type": "lane_detection",
@@ -457,6 +458,8 @@ def lane_detection_row(
         row["confirmations"] = confirmations
     if api_observation_key:
         row["api_observation_key"] = api_observation_key
+    if origin:
+        row["origin"] = origin
     return row
 
 

@@ -181,14 +181,24 @@ class ConfirmationBuffer:
             raise ValueError("confirmations must be non-negative")
         self.confirmations = confirmations
         self._pending: dict[str, DecodedFill] = {}
+        self._origins: dict[str, str] = {}
 
-    def add(self, fill: DecodedFill) -> None:
+    def add(self, fill: DecodedFill, origin: str = "live") -> None:
         self._pending[fill.durable_trade_id] = fill
+        self._origins[fill.durable_trade_id] = origin
 
     def remove(self, durable_trade_id: str) -> DecodedFill | None:
+        self._origins.pop(durable_trade_id, None)
         return self._pending.pop(durable_trade_id, None)
 
-    def finalizable(self, head_block: int) -> list[DecodedFill]:
+    def finalizable(self, head_block: int) -> list[tuple[DecodedFill, str]]:
+        """Pop confirmed fills with the ingest origin that queued them.
+
+        Origin matters downstream: a fill delivered via gap backfill is old by
+        construction, so the follower classifies its stale rejection as
+        ``stale_recovery`` (system recovering as designed) instead of
+        ``stale_fill`` (live lane genuinely late).
+        """
         ready = [
             fill
             for fill in self._pending.values()
@@ -196,7 +206,11 @@ class ConfirmationBuffer:
         ]
         for fill in ready:
             self._pending.pop(fill.durable_trade_id, None)
-        return sorted(ready, key=lambda fill: (fill.block_number, fill.log_index))
+        pairs = [
+            (fill, self._origins.pop(fill.durable_trade_id, "live"))
+            for fill in ready
+        ]
+        return sorted(pairs, key=lambda pair: (pair[0].block_number, pair[0].log_index))
 
     def __len__(self) -> int:
         return len(self._pending)

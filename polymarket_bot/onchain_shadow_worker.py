@@ -170,7 +170,7 @@ class OnchainShadowWorker:
                 }
             )
             return
-        self.confirmations.add(fill)
+        self.confirmations.add(fill, origin=origin)
         self.stats["owner_events_pending"] += 1
 
     async def finalize_ready(
@@ -178,7 +178,7 @@ class OnchainShadowWorker:
     ) -> None:
         detected_at = detection_epoch if detection_epoch is not None else time.time()
         ready = self.confirmations.finalizable(head_block)
-        for fill in ready:
+        for fill, origin in ready:
             try:
                 block = await asyncio.to_thread(self.rpc.block, fill.block_number)
             except Exception as exc:
@@ -192,7 +192,7 @@ class OnchainShadowWorker:
                     }
                 )
                 # Put it back so a transient HTTP failure cannot create a miss.
-                self.confirmations.add(fill)
+                self.confirmations.add(fill, origin=origin)
                 continue
             canonical_hash = str((block or {}).get("hash") or "").lower()
             if not block or canonical_hash != fill.block_hash:
@@ -225,7 +225,7 @@ class OnchainShadowWorker:
                         "reason": "missing_block_timestamp",
                     }
                 )
-                self.confirmations.add(fill)
+                self.confirmations.add(fill, origin=origin)
                 continue
             if ground_truth_epoch < self.started_at_epoch:
                 self.log.append(
@@ -249,6 +249,7 @@ class OnchainShadowWorker:
                 wallet=fill.maker,
                 market=self.metadata.resolve(fill.token_id),
                 confirmations=self.config.confirmations,
+                origin=origin,
             )
             self.log.append(row)
             self.stats["polygon_onchain_detections"] += 1

@@ -444,6 +444,7 @@ def onchain_lane_to_fill(row: dict[str, Any]) -> dict[str, Any] | None:
     follower_observed = utc_now()
     return {
         "type": "fill",
+        "origin": row.get("origin"),
         # Staleness is measured when the follower actually sees the row.  Using
         # the worker timestamp here would incorrectly accept a backlog after a
         # follower outage as if it were still an eight-second-old signal.
@@ -699,7 +700,15 @@ def reject_reasons(
     fill_ts = parse_ts(row.get("fill_timestamp") or (row.get("trade") or {}).get("timestamp"))
     detect_ts = parse_ts(row.get("ts")) or utc_now()
     if fill_ts and (detect_ts - fill_ts).total_seconds() > cfg.stale_fill_seconds:
-        reasons.append("stale_fill")
+        # Gap-backfilled fills are old by construction (RPC failover replay);
+        # rejecting them is the gate working as designed, not the live lane
+        # being slow.  Classify separately so the go-live gate measures only
+        # steady-state staleness.
+        origin = str(row.get("origin") or "")
+        if origin in {"gap_backfill", "initial_backfill"}:
+            reasons.append("stale_recovery")
+        else:
+            reasons.append("stale_fill")
     book = row.get("book_at_detection") if isinstance(row.get("book_at_detection"), dict) else None
     if not book:
         reasons.append("no_archived_book")
@@ -858,8 +867,10 @@ class PaperFollowerDaemon:
         today = utc_now().strftime("%Y-%m-%d")
         if not force and today == self._daily_key:
             return
+        from .ledger_history import read_ledger_history
+
         start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
-        rows = read_jsonl(self.cfg.ledger_path)
+        rows = read_ledger_history(self.cfg.paper_dir)
         todays_rows = [r for r in rows if (parse_ts(r.get("ts")) or start) >= start]
         quarantined = quarantined_position_ids(rows, self.cfg)
         self._daily_key = today
@@ -884,10 +895,12 @@ class PaperFollowerDaemon:
         if not force and now - self._wallet_scores_at < self.cfg.wallet_scores_refresh_seconds:
             return
         try:
+            from .ledger_history import ledger_segment_paths
             from .wallet_quality import compute_wallet_quality
 
             rows = compute_wallet_quality(
                 ledger_path=self.cfg.ledger_path,
+                ledger_paths=ledger_segment_paths(self.cfg.paper_dir),
                 state_path=self.cfg.state_path,
             )
             self._wallet_scores = {
