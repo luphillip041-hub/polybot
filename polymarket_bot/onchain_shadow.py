@@ -314,6 +314,7 @@ class OnchainShadowConfig:
     fallback_http_rpc_urls: tuple[str, ...] = ()
     paper_follower_integrated: bool = False
     head_stale_seconds: float = 45.0
+    api_max_observation_age_seconds: float = 300.0
 
     @classmethod
     def from_env(cls) -> "OnchainShadowConfig":
@@ -333,6 +334,9 @@ class OnchainShadowConfig:
             max_backfill_blocks=int(os.getenv("ONCHAIN_MAX_BACKFILL_BLOCKS", "2048")),
             heartbeat_seconds=int(os.getenv("ONCHAIN_HEARTBEAT_SECONDS", "60")),
             api_tail_seconds=int(os.getenv("ONCHAIN_API_TAIL_SECONDS", "15")),
+            api_max_observation_age_seconds=float(
+                os.getenv("ONCHAIN_API_MAX_OBSERVATION_AGE_SECONDS", "300")
+            ),
             output_path=Path(
                 os.getenv(
                     "ONCHAIN_SHADOW_LOG", str(shadow_dir / "shadow_onchain.jsonl")

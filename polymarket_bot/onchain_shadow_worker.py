@@ -270,6 +270,23 @@ class OnchainShadowWorker:
             )
             self.stats["cross_source_mismatches"] += 1
             return
+        now_epoch = time.time()
+        if now_epoch - detection_epoch > self.config.api_max_observation_age_seconds:
+            # The Data API lane is a fallback/reconciliation feed.  Rows this
+            # old can never be tradeable (the follower's stale gate is 120s)
+            # and only exist when the archive is re-scanned after a restart —
+            # emitting them floods the follower with phantom stale signals.
+            self.log.append(
+                {
+                    "type": "stale_api_observation",
+                    "source": "data_api",
+                    "api_observation_key": key or None,
+                    "detection_epoch": detection_epoch,
+                    "age_seconds": now_epoch - detection_epoch,
+                }
+            )
+            self.stats["stale_api_observations"] += 1
+            return
         try:
             match, ground_truth_epoch, _fills = await asyncio.to_thread(
                 reconcile_data_api_row, row, self.rpc
