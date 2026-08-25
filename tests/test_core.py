@@ -639,13 +639,18 @@ class CoreTests(unittest.TestCase):
             cfg.allowlist_path.write_text(json.dumps({"wallets": ["0xw"]}))
             acfg = ArchiveConfig(archive_dir=root / "archive", state_path=root / "state.json", followup_queue_path=root / "followups.json")
             daemon = PaperFollowerDaemon(cfg, acfg)
-            with patch("polymarket_bot.paper_follower.run_resolution_cycle") as m:
-                m.return_value = {"checked": 0, "resolved": 0, "skipped": 0, "last_checked_at": "x"}
+            with patch("polymarket_bot.paper_follower.check_positions_for_resolution") as m:
+                m.return_value = []
                 self.assertIsNone(daemon.process_resolution_once())
-                # Force bypasses throttle
-                summary = daemon.process_resolution_once(force=True)
-                self.assertEqual(summary["checked"], 0)
+                # Force kicks a background check; the first call has nothing to harvest
+                self.assertIsNone(daemon.process_resolution_once(force=True))
                 self.assertGreaterEqual(m.call_count, 1)
+                daemon._resolution_thread.join(timeout=10)
+                # Next call harvests the finished check on the main thread
+                summary = daemon.process_resolution_once()
+                self.assertIsNotNone(summary)
+                self.assertEqual(summary["checked"], 0)
+                self.assertNotIn("error", summary)
 
     def test_render_resolution_webhook_label(self):
         # Resolution row renders as "MARKET RESOLVED"

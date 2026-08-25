@@ -17,6 +17,10 @@ EnvironmentFile=-/root/flip/secrets/copybot_paper_webhook.env
 ExecStart=/usr/bin/python3 -m polymarket_bot.paper_follower
 Restart=always
 RestartSec=5
+# Sized for full-ledger history reads (wallet-quality ratchet + daily counters):
+# a 384M memory.high here throttled the process into an 8h crawl on 2026-08-24.
+MemoryMax=1024M
+MemoryHigh=768M
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

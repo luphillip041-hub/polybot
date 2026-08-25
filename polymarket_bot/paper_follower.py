@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import signal
+import threading
 import time
 import urllib.request
 from collections import Counter
@@ -680,6 +681,19 @@ def market_resolution_soon(book: dict[str, Any], now: datetime) -> bool:
     return False
 
 
+def _fill_is_stale(row: dict[str, Any], stale_seconds: float) -> bool:
+    """Timestamp-only staleness pre-check (mirrors reject_reasons' stale gate).
+
+    Used to skip the live book fetch for fills that will be rejected as stale
+    regardless — e.g. thousands of backlogged fills after an outage.
+    """
+    fill_ts = parse_ts(row.get("fill_timestamp") or (row.get("trade") or {}).get("timestamp"))
+    if fill_ts is None:
+        return False
+    detect_ts = parse_ts(row.get("ts")) or utc_now()
+    return (detect_ts - fill_ts).total_seconds() > stale_seconds
+
+
 def reject_reasons(
     row: dict[str, Any],
     cfg: PaperConfig,
@@ -862,6 +876,10 @@ class PaperFollowerDaemon:
         self.running = True
         self._last_resolution_at = time.time()
         self._resolution_summary: dict[str, Any] = {"last_checked_at": None, "checked": 0, "resolved": 0, "skipped": 0}
+        self._resolution_lock = threading.Lock()
+        self._resolution_thread: threading.Thread | None = None
+        # (ok, actions); ok=False means the background check raised.
+        self._resolution_result: tuple[bool, list[dict[str, Any]]] | None = None
 
     def _refresh_daily_counters(self, *, force: bool = False) -> None:
         today = utc_now().strftime("%Y-%m-%d")
@@ -945,9 +963,11 @@ class PaperFollowerDaemon:
         fill_ts = parse_ts(row.get("fill_timestamp") or trade.get("timestamp"))
         latency = (detect_ts - fill_ts).total_seconds() if fill_ts else None
         # Backstop BBO: if archive hasn't caught up yet, hit CLOB REST once
-        # (cached for 30s by token) so the signal can pass rejection checks
+        # (cached for 30s by token) so the signal can pass rejection checks.
+        # Never for timestamp-stale fills: they reject regardless, and the
+        # fetch is what turned outage backlogs into hour-long crawls.
         book = row.get("book_at_detection") if isinstance(row.get("book_at_detection"), dict) else {}
-        if not book:
+        if not book and not _fill_is_stale(row, self.cfg.stale_fill_seconds):
             _token = str(trade.get("asset") or book.get("token_id") or "")
             backstop = rest_backstop_bbo(_token)
             if backstop:
@@ -1082,7 +1102,13 @@ class PaperFollowerDaemon:
             )
             for fill in fills:
                 token = str((fill.get("trade") or {}).get("asset") or "")
-                fill["book_at_detection"] = live_clob_book(token)
+                if _fill_is_stale(fill, self.cfg.stale_fill_seconds):
+                    # Already dead on arrival — one HTTP fetch per stale fill
+                    # turns post-outage backlog replay into a 30-minute crawl.
+                    # reject_reasons short-circuits on a missing book anyway.
+                    fill["book_at_detection"] = None
+                else:
+                    fill["book_at_detection"] = live_clob_book(token)
                 rows = self.process_fill(fill, accepts_today)
                 if rows:
                     entry_present = any(r.get("type") == "entry" for r in rows)
@@ -1140,24 +1166,61 @@ class PaperFollowerDaemon:
         return wrote
 
     def process_resolution_once(self, *, force: bool = False) -> dict[str, Any] | None:
-        """Run a single resolution cycle if the throttle window has elapsed (or force=True).
+        """Kick off/harvest resolution checks without ever blocking the loop.
 
-        Returns the summary dict on a real cycle, None if throttled.
+        The RPC-bound position scan runs on a daemon thread; its results are
+        applied on the next call from the main thread, so all ledger/state
+        writes stay serialized.  Before this split, one slow resolution pass
+        (e.g. RPC 429s x ~150 positions x timeouts) froze signal processing
+        for over an hour while systemd still reported the service 'active'.
         """
+        harvested: dict[str, Any] | None = None
+        with self._resolution_lock:
+            if self._resolution_result is not None:
+                ok, actions = self._resolution_result
+                self._resolution_result = None
+                if ok:
+                    harvested = apply_resolution_actions(self.state, self.cfg, actions)
+                else:
+                    harvested = {
+                        "checked": 0,
+                        "resolved": 0,
+                        "skipped": 0,
+                        "exit_rows": [],
+                        "last_checked_at": iso_now(),
+                        "error": True,
+                    }
+                self._resolution_summary = harvested
+                for row in harvested.get("exit_rows", []):
+                    self._pnl_today += num(row.get("pnl"), 0)
         now = time.time()
         interval = float(self.cfg.resolution_poll_seconds or 1800)
         if not force and (now - self._last_resolution_at) < interval:
-            return None
+            return harvested
+        if self._resolution_thread is not None and self._resolution_thread.is_alive():
+            LOG.warning("resolution check still running; skipping kickoff this cycle")
+            return harvested
         self._last_resolution_at = now
-        try:
-            summary = run_resolution_cycle(self.state, self.cfg)
-        except Exception:
-            LOG.exception("resolution cycle failed")
-            return {"checked": 0, "resolved": 0, "skipped": 0, "last_checked_at": iso_now(), "error": True}
-        self._resolution_summary = summary
-        for row in summary.get("exit_rows", []):
-            self._pnl_today += num(row.get("pnl"), 0)
-        return summary
+        # Snapshot positions so the network thread never iterates a dict the
+        # main loop is mutating.
+        positions_snapshot = dict(self.state.get("positions") or {})
+        probe_state = {"positions": positions_snapshot}
+
+        def _check() -> None:
+            try:
+                result = check_positions_for_resolution(probe_state)
+                outcome: tuple[bool, list[dict[str, Any]]] = (True, result)
+            except Exception:
+                LOG.exception("resolution check failed")
+                outcome = (False, [])
+            with self._resolution_lock:
+                self._resolution_result = outcome
+
+        self._resolution_thread = threading.Thread(
+            target=_check, daemon=True, name="resolution-check"
+        )
+        self._resolution_thread.start()
+        return harvested
 
     def run(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -1441,6 +1504,18 @@ def run_resolution_cycle(state: dict[str, Any], cfg: PaperConfig, config: BotCon
     from .config import CONFIG as _default_cfg
     cfg_bot: BotConfig = config if isinstance(config, BotConfig) else _default_cfg  # type: ignore[assignment]
     actions = check_positions_for_resolution(state, config=cfg_bot)
+    return apply_resolution_actions(state, cfg, actions)
+
+
+def apply_resolution_actions(
+    state: dict[str, Any], cfg: PaperConfig, actions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Persist resolution outcomes: pop positions, append exit rows, notify.
+
+    Split from the network phase so the follower can run the (slow, RPC-bound)
+    check on a background thread while this write phase stays on the main
+    loop, serialized with all other ledger/state writes.
+    """
     summary: dict[str, Any] = {
         "checked": len(actions),
         "resolved": 0,
