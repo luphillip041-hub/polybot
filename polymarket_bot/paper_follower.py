@@ -58,7 +58,10 @@ class PaperConfig:
         os.getenv("PAPER_WALLET_SCORES_REFRESH_SECONDS", "900")
     )
     max_ws_age_seconds: float = 60.0
-    haircut: float = 0.005
+    # Honest-model default (2026-08-26): measured +12s drift made the old 0.5c
+    # assumption ~27% flattered.  1c covers the median-case cost; PF under
+    # this model is the number the go-live gate reads.
+    haircut: float = float(os.getenv("PAPER_HAIRCUT", "0.010"))
     poll_interval_seconds: float = 3.0
     stale_position_days: int = 14
     resolution_poll_seconds: float = float(os.getenv("POLYMARKET_RESOLUTION_POLL_SECONDS", "1800"))
