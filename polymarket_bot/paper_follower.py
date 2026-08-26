@@ -861,7 +861,7 @@ class PaperFollowerDaemon:
         self._wallet_scores_at = 0.0
         self._refresh_wallet_scores(force=True)
         from .fill_shadow import FillShadow
-        from .live_executor import QuoteOnlyExecutor
+        from .live_executor import LiveClobExecutor, QuoteOnlyExecutor, is_live
 
         self._fill_shadow = FillShadow(
             self.cfg.paper_dir / "fill_shadow_pending.json",
@@ -871,11 +871,18 @@ class PaperFollowerDaemon:
             stake_usd=self.cfg.stake_usd,
             enabled=self.cfg.fill_shadow_enabled,
         )
-        self._executor = (
-            QuoteOnlyExecutor(self.cfg.paper_dir / "live_quotes.jsonl")
-            if self.cfg.live_quotes_enabled
-            else None
-        )
+        self._live_journal_path = self.cfg.root / "runs" / "live" / "live_fills.jsonl"
+        self._executor = None
+        if self.cfg.live_quotes_enabled:
+            if is_live():
+                # Fail loud on misconfiguration: live gates set but executor
+                # cannot construct (missing creds etc.) must kill the service,
+                # not silently degrade to paper behavior.
+                self._executor = LiveClobExecutor(
+                    self.cfg.root / "runs" / "live" / "live_orders.json"
+                )
+            else:
+                self._executor = QuoteOnlyExecutor(self.cfg.paper_dir / "live_quotes.jsonl")
         self.running = True
         self._last_resolution_at = time.time()
         self._resolution_summary: dict[str, Any] = {"last_checked_at": None, "checked": 0, "resolved": 0, "skipped": 0}
@@ -1152,6 +1159,10 @@ class PaperFollowerDaemon:
         for check_row in self._fill_shadow.run_due():
             append_jsonl_fsync(self.cfg.ledger_path, check_row)
             wrote += 1
+        housekeep = getattr(self._executor, "housekeep", None)
+        if housekeep is not None:
+            for live_row in housekeep():
+                append_jsonl_fsync(self._live_journal_path, live_row)
         # Memory: cap processed_trade_ids growth in memory between writes
         ptids = self.state.get("processed_trade_ids", [])
         if len(ptids) > MAX_PROCESSED_TRADE_IDS_INMEM:

@@ -155,10 +155,17 @@ def test_quote_only_executor_journals_without_network(tmp_path: Path) -> None:
     assert on_disk[0]["ts_epoch"] == 1234.0
 
 
-def test_live_executor_fails_closed() -> None:
+def test_live_executor_fails_closed(tmp_path) -> None:
+    class _Client:
+        pass
+
     with pytest.raises(RuntimeError, match="POLYMARKET_PHASE"):
-        LiveClobExecutor(env={})
+        LiveClobExecutor(tmp_path / "o.json", env={}, client=_Client())
     with pytest.raises(RuntimeError, match="POLYMARKET_PHASE"):
-        LiveClobExecutor(env={"POLYMARKET_PHASE": "live"})
-    with pytest.raises(RuntimeError, match="API_KEY"):
-        LiveClobExecutor(env={"POLYMARKET_PHASE": "live", "LIVETRADE_ENABLED": "true"})
+        LiveClobExecutor(tmp_path / "o.json", env={"POLYMARKET_PHASE": "live"}, client=_Client())
+    # Gates on but no credentials at all -> from_env raises (fail closed)
+    with pytest.raises(RuntimeError):
+        LiveClobExecutor(
+            tmp_path / "o.json",
+            env={"POLYMARKET_PHASE": "live", "LIVETRADE_ENABLED": "true"},
+        )
