@@ -314,7 +314,11 @@ class OnchainShadowConfig:
     fallback_http_rpc_urls: tuple[str, ...] = ()
     paper_follower_integrated: bool = False
     head_stale_seconds: float = 45.0
-    api_max_observation_age_seconds: float = 300.0
+    # Aligned 2026-08-28 below the follower's 120s stale gate: Data API rows
+    # older than this can NEVER become entries (the follower rejects >120s as
+    # stale_fill), so forwarding them only poisoned the go-live metric with
+    # harmless duplicate rejects (p50 lane latency ~239s => ~840 rejects/day).
+    api_max_observation_age_seconds: float = 110.0
 
     @classmethod
     def from_env(cls) -> "OnchainShadowConfig":
@@ -335,7 +339,7 @@ class OnchainShadowConfig:
             heartbeat_seconds=int(os.getenv("ONCHAIN_HEARTBEAT_SECONDS", "60")),
             api_tail_seconds=int(os.getenv("ONCHAIN_API_TAIL_SECONDS", "15")),
             api_max_observation_age_seconds=float(
-                os.getenv("ONCHAIN_API_MAX_OBSERVATION_AGE_SECONDS", "300")
+                os.getenv("ONCHAIN_API_MAX_OBSERVATION_AGE_SECONDS", "110")
             ),
             output_path=Path(
                 os.getenv(

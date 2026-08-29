@@ -71,8 +71,34 @@ def test_stale_threshold_is_configurable(tmp_path: Path) -> None:
     from polymarket_bot.onchain_shadow import OnchainShadowConfig
 
     cfg = make_config(tmp_path)
-    assert cfg.api_max_observation_age_seconds == 300.0
+    assert cfg.api_max_observation_age_seconds == 110.0
     cfg2 = OnchainShadowConfig(
         **{**cfg.__dict__, "api_max_observation_age_seconds": 60.0}
     )
     assert cfg2.api_max_observation_age_seconds == 60.0
+
+
+def test_boundary_rows_route_by_gate(tmp_path: Path, monkeypatch) -> None:
+    """Rows older than the gate are dropped before reconcile; fresher pass."""
+    cfg = make_config(tmp_path)
+    cfg.allowlist_path.write_text(json.dumps({"wallets": ["0xtracked"]}))
+    worker = worker_mod.OnchainShadowWorker(cfg, rpc=object())
+    calls = []
+
+    def _fake_reconcile(row, rpc):
+        calls.append(row)
+
+        class Match:
+            status = "no_chain_match"
+            fill = None
+            candidate_count = 0
+
+        return Match(), None, []
+
+    monkeypatch.setattr(worker_mod, "reconcile_data_api_row", _fake_reconcile)
+    # 115s old: beyond the 110s gate -> dropped as stale_api_observation
+    asyncio.run(worker.process_data_api_row(_api_row(time.time() - 115)))
+    # 60s old: fresh enough to forward (follower dedupes against primary lane)
+    asyncio.run(worker.process_data_api_row(_api_row(time.time() - 60)))
+    assert len(calls) == 1
+    assert worker.stats["stale_api_observations"] == 1
