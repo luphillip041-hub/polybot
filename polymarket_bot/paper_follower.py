@@ -895,20 +895,39 @@ class PaperFollowerDaemon:
         today = utc_now().strftime("%Y-%m-%d")
         if not force and today == self._daily_key:
             return
-        from .ledger_history import read_ledger_history
+        from .ledger_history import iter_ledger_rows
 
         start = utc_now().replace(hour=0, minute=0, second=0, microsecond=0)
-        rows = read_ledger_history(self.cfg.paper_dir)
-        todays_rows = [r for r in rows if (parse_ts(r.get("ts")) or start) >= start]
-        quarantined = quarantined_position_ids(rows, self.cfg)
+        # Stream, never materialize: history is 270k+ rows (~800MB as dicts)
+        # and this runs at startup while the process is already near its
+        # cgroup memory.high — materializing it throttled startup past the
+        # watchdog's 10-min silence window (restart loop of 2026-08-29).
+        accepts = 0
+        pnl = 0.0
+        quarantined: set[str] = set()
+        quarantine_on = bool(self.cfg.quarantine_low_price)
+        for row in iter_ledger_rows(self.cfg.paper_dir):
+            if (
+                quarantine_on
+                and row.get("type") == "entry"
+                and row.get("position_id")
+                and (
+                    row.get("quarantined_low_price")
+                    or num(row.get("wallet_fill_price"), 1.0) < 0.10
+                )
+            ):
+                quarantined.add(str(row["position_id"]))
+            if (parse_ts(row.get("ts")) or start) < start:
+                continue
+            if row.get("type") == "entry":
+                accepts += 1
+            elif row.get("type") in {"exit", "resolution", "void_correction"}:
+                pid = str(row.get("position_id") or "")
+                if not quarantine_on or pid not in quarantined:
+                    pnl += num(row.get("pnl"), 0)
         self._daily_key = today
-        self._accepts_today = sum(1 for r in todays_rows if r.get("type") == "entry")
-        self._pnl_today = sum(
-            num(r.get("pnl"), 0)
-            for r in todays_rows
-            if r.get("type") in {"exit", "resolution", "void_correction"}
-            and str(r.get("position_id") or "") not in quarantined
-        )
+        self._accepts_today = accepts
+        self._pnl_today = pnl
 
     def _refresh_wallet_scores(self, *, force: bool = False) -> None:
         """Refresh wallet -> quality_score from our own ledger outcomes.
