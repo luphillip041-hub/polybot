@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket Copybot Ops Dashboard (read-only)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/flip/projects/polymarket-copybot
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYMARKET_DASH_HOST=0.0.0.0
+Environment=POLYMARKET_DASH_PORT=8730
+Environment=POLYMARKET_DASH_REFRESH_SECONDS=30
+ExecStart=/usr/bin/python3 -m polymarket_bot.dashboard_server
+Restart=always
+RestartSec=5
+MemoryHigh=384M
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
