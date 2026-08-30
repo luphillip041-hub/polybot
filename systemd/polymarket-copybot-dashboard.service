@@ -7,7 +7,7 @@ Type=simple
 WorkingDirectory=/root/flip/projects/polymarket-copybot
 Environment=PYTHONUNBUFFERED=1
 Environment=POLYMARKET_DASH_HOST=0.0.0.0
-Environment=POLYMARKET_DASH_PORT=8730
+Environment=POLYMARKET_DASH_PORT=8740
 Environment=POLYMARKET_DASH_REFRESH_SECONDS=30
 ExecStart=/usr/bin/python3 -m polymarket_bot.dashboard_server
 Restart=always
