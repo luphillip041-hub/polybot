@@ -14,6 +14,8 @@ steps; each one exists because something already broke once.
       Polymarket blocks US users on the main venue. If the account is US-based
       this stops here.
 
+- [ ] **Permanent dashboard URL** — quick-tunnel hostnames rotate; before real money, stand up a named Cloudflare tunnel / domain for the ops dashboard (decision logged 2026-08-31)
+
 ## 2. Credentials file
 
 Create `/root/flip/secrets/polymarket_live.env`, `chmod 600`, owner root:
