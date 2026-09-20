@@ -246,6 +246,10 @@ def main() -> int:
     parser.add_argument("--date", help="UTC day YYYY-MM-DD (default: yesterday)")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--ledger", default=str(LEDGER))
+    parser.add_argument(
+        "--timing-json",
+        help="JSON from scripts/analyze_entry_timing.py (adds TIMING line; no Gamma fetch here)",
+    )
     args = parser.parse_args()
 
     import datetime as dt
@@ -277,15 +281,24 @@ def main() -> int:
     recent_stats = window_stats(recent_rows)
     bar_rows = bars(alltime, recent_stats)
 
+    timing_line = None
+    timing_payload = None
+    if args.timing_json:
+        from polymarket_bot.scorecard_slices import timing_line_from_analysis
+
+        timing_payload = json.loads(Path(args.timing_json).read_text())
+        timing_line = timing_line_from_analysis(timing_payload)
+
     if args.json:
-        print(
-            json.dumps(
-                {"day": day, "day_stats": day_stats, "alltime": alltime, "bars": bar_rows},
-                indent=1,
-            )
-        )
+        out = {"day": day, "day_stats": day_stats, "alltime": alltime, "bars": bar_rows}
+        if timing_payload is not None:
+            out["timing"] = timing_payload.get("summary") if isinstance(timing_payload, dict) else timing_payload
+        print(json.dumps(out, indent=1))
     else:
-        print(render_text(day, day_stats, alltime, bar_rows))
+        text = render_text(day, day_stats, alltime, bar_rows)
+        if timing_line:
+            text = text + "\n" + timing_line
+        print(text)
     return 0
 
 

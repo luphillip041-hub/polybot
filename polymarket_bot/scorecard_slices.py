@@ -5,8 +5,10 @@ are a mechanical pair whose formula EV is slightly negative.  Headline
 P&L that counts both legs is not a directional test.  Callers should
 report the single-sided / deduped slice next to the raw totals.
 
-TODO: prove each entry timestamp precedes the real-world outcome (not
-only on-chain resolution).  That measurement is out of scope here.
+Entry vs real-world outcome (pack open item 3) is implemented in
+``polymarket_bot/entry_timing.py`` / ``scripts/analyze_entry_timing.py``.
+Pass that script's JSON to ``paper_scorecard.py --timing-json`` to print a
+TIMING line.  Ledger hold time is *not* a substitute for Gamma endDate.
 """
 
 from __future__ import annotations
@@ -91,3 +93,20 @@ def slice_pnl(closed: list[dict[str, Any]]) -> dict[str, Any]:
         "win_rate_pct": round(wins / n * 100, 2) if n else None,
         "pnl": round(pnl, 2),
     }
+
+
+def timing_line_from_analysis(payload: dict[str, Any]) -> str:
+    """One-line scorecard excerpt from ``analyze_entry_timing.py`` JSON."""
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else payload
+    if not isinstance(summary, dict):
+        return "TIMING unavailable"
+    wins = summary.get("wins") if isinstance(summary.get("wins"), dict) else {}
+    losses = summary.get("losses") if isinstance(summary.get("losses"), dict) else {}
+    return (
+        f"TIMING known={summary.get('known')} unknown={summary.get('unknown')} "
+        f"precedes={summary.get('precedes')}({summary.get('precedes_pct_of_known')}% of known) "
+        f"suspicious={summary.get('suspicious')} "
+        f"wins_precedes={wins.get('precedes_pct_of_known')}% "
+        f"losses_precedes={losses.get('precedes_pct_of_known')}% "
+        f"lead_p50_s={(summary.get('lead_s') or {}).get('p50')}"
+    )
