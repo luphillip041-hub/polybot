@@ -359,19 +359,32 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(gap["reason"], "ws_stale")
             self.assertEqual(gap["tokens_affected_count"], 1)
 
-    def test_paper_fill_model_walks_levels_and_haircuts(self):
-        book = {
+    def test_paper_fill_model_caps_at_top_of_book_and_haircuts(self):
+        thin = {
             "top3_asks": [{"price": 0.5, "size": 100}, {"price": 0.6, "size": 100}],
             "top3_bids": [{"price": 0.4, "size": 100}, {"price": 0.3, "size": 100}],
         }
-        buy_price, buy_size, err = simulate_fill(book, "BUY", 100, 0.005)
+        # Default: do not walk past the best level. $100 cannot fill at ~$50 TOB.
+        buy_price, buy_size, err = simulate_fill(thin, "BUY", 100, 0.005)
+        self.assertIsNone(buy_price)
+        self.assertEqual(buy_size, 0.0)
+        self.assertEqual(err, "insufficient_depth")
+        deep = {
+            "top3_asks": [{"price": 0.5, "size": 1000}, {"price": 0.6, "size": 100}],
+            "top3_bids": [{"price": 0.4, "size": 1000}, {"price": 0.3, "size": 100}],
+        }
+        buy_price, buy_size, err = simulate_fill(deep, "BUY", 100, 0.005)
         self.assertIsNone(err)
-        self.assertGreater(buy_price, 0.5)
+        self.assertAlmostEqual(buy_price, 0.505)
         self.assertGreater(buy_size, 0)
-        sell_price, sell_size, err = simulate_fill(book, "SELL", 60, 0.005)
+        sell_price, sell_size, err = simulate_fill(deep, "SELL", 60, 0.005)
         self.assertIsNone(err)
-        self.assertLess(sell_price, 0.4)
+        self.assertAlmostEqual(sell_price, 0.395)
         self.assertGreater(sell_size, 0)
+        # Explicit opt-out still walks the tail (legacy / measurement only).
+        walked, _, walk_err = simulate_fill(thin, "BUY", 100, 0.005, max_levels=None)
+        self.assertIsNone(walk_err)
+        self.assertGreater(walked, 0.505)
 
     def test_paper_follower_rejects_stale_fill_and_status_shape(self):
         with tempfile.TemporaryDirectory() as td:

@@ -9,7 +9,10 @@ This module prunes:
 3. runs/paper/ledger.jsonl: ROTATE into paper/ledger_archive/*.jsonl.gz if >
    150MB (never destructive — the old 100k-line trim silently destroyed
    history and made every all-time statistic a moving target)
-4. Hard cap: if total runs/ size > MAX_RUNS_GB, delete oldest shadow_ files
+4. runs/onchain_shadow/shadow_onchain.jsonl: ROTATE into
+   onchain_shadow/archive/*.jsonl.gz if > 64MB (the unbounded live file
+   was ~714MB / most of runs/ at the 2026-09 pack)
+5. Hard cap: if total runs/ size > MAX_RUNS_GB, delete oldest shadow_ files
 
 State files (state.json, scan_latest.json, decisions_latest.json,
 wallet_scores_latest.json, etc.) are NEVER touched.
@@ -39,6 +42,9 @@ logger = logging.getLogger("polymarket_bot.cleanup")
 BOOK_RETENTION_DAYS = 1
 SHADOW_RETENTION_DAYS = 30
 LEDGER_ROTATE_BYTES = 150 * 1024 * 1024  # ~9-10 days of rows stay hot
+ONCHAIN_SHADOW_ROTATE_BYTES = int(
+    os.getenv("ONCHAIN_SHADOW_ROTATE_BYTES", str(64 * 1024 * 1024))
+)
 MAX_RUNS_GB = 2.0
 DEFAULT_RUNS_DIR = Path("/root/flip/projects/polymarket-copybot/runs")
 
@@ -63,6 +69,7 @@ class CleanupResult:
     files_deleted: int = 0
     bytes_freed: int = 0
     ledger_trimmed: bool = False
+    onchain_shadow_rotated: bool = False
     errors: list[str] = field(default_factory=list)
     duration_s: float = 0.0
     total_before_bytes: int = 0
@@ -77,6 +84,7 @@ class CleanupResult:
             "bytes_freed": self.bytes_freed,
             "bytes_freed_mb": round(self.bytes_freed / 1e6, 2),
             "ledger_trimmed": self.ledger_trimmed,
+            "onchain_shadow_rotated": self.onchain_shadow_rotated,
             "errors": self.errors,
             "duration_s": round(self.duration_s, 2),
             "total_before_mb": round(self.total_before_bytes / 1e6, 2),
@@ -184,6 +192,57 @@ def _rotate_ledger(runs_dir: Path, dry_run: bool, result: CleanupResult) -> bool
         return False
 
 
+def _rotate_onchain_shadow(runs_dir: Path, dry_run: bool, result: CleanupResult) -> bool:
+    """Rotate the unbounded on-chain shadow JSONL the same way as the ledger.
+
+    Atomic rename of the live file; the worker re-opens by path on the next
+    append (MeasurementLog uses O_APPEND|O_CREAT).  The paper follower's
+    byte offset is reset by ``iter_new_onchain_fills`` when offset > size,
+    so a rotation cannot replay archived rows as new signals.
+    """
+    live = runs_dir / "onchain_shadow" / "shadow_onchain.jsonl"
+    if not live.exists():
+        return False
+    try:
+        size = live.stat().st_size
+    except FileNotFoundError:
+        return False
+    if size < ONCHAIN_SHADOW_ROTATE_BYTES:
+        return False
+    logger.info(
+        "shadow_onchain.jsonl is %d MB, rotating to archive...",
+        size // 1_048_576,
+    )
+    if dry_run:
+        result.onchain_shadow_rotated = True
+        return True
+    try:
+        archive_dir = live.parent / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        import datetime as _dt
+
+        stamp = _dt.datetime.now(_dt.UTC).strftime("%Y%m%d-%H%M%S")
+        segment = archive_dir / f"shadow_onchain-{stamp}-{time.time_ns() % 1_000_000:06d}.jsonl"
+        os.replace(live, segment)
+        gz_path = segment.with_suffix(segment.suffix + ".gz")
+        with open(segment, "rb") as src, gzip.open(gz_path, "wb", compresslevel=6) as dst:
+            while True:
+                chunk = src.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        segment.unlink()
+        logger.info(
+            "rotated onchain shadow: %.1f MB → %s (%.1f MB gz)",
+            size / 1e6, gz_path.name, gz_path.stat().st_size / 1e6,
+        )
+        result.onchain_shadow_rotated = True
+        return True
+    except Exception as e:
+        result.errors.append(f"onchain shadow rotate: {e}")
+        return False
+
+
 def _hard_cap(runs_dir: Path, max_gb: float, dry_run: bool, result: CleanupResult) -> int:
     """If total runs/ exceeds max_gb, delete oldest shadow_ files until under cap."""
     if not runs_dir.exists():
@@ -265,7 +324,10 @@ def run_cleanup(
     # 3. Rotate ledger into archive if too big (non-destructive)
     _rotate_ledger(runs_dir, dry_run, result)
 
-    # 4. Hard cap enforcement
+    # 4. Rotate unbounded on-chain shadow JSONL (non-destructive)
+    _rotate_onchain_shadow(runs_dir, dry_run, result)
+
+    # 5. Hard cap enforcement
     cnt_before = result.files_deleted
     freed = _hard_cap(runs_dir, max_gb, dry_run, result)
     result.bytes_freed += freed
@@ -320,6 +382,7 @@ def main() -> int:
         print(f"  Total before:  {d['total_before_mb']} MB")
         print(f"  Total after:   {d['total_after_mb']} MB")
         print(f"  Ledger rotated: {result.ledger_trimmed}")
+        print(f"  Onchain shadow rotated: {result.onchain_shadow_rotated}")
         if d["errors"]:
             print(f"  Errors: {len(d['errors'])}")
             for e in d["errors"][:5]:

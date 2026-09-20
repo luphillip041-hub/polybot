@@ -78,6 +78,7 @@ class MeasurementLog:
     # Data API fallback window (~1h).  48h is far beyond both; loading the
     # full multi-week history cost ~450MB RSS at startup.
     DEFAULT_DEDUP_WINDOW_SECONDS = 48 * 3600
+    ARCHIVE_DIRNAME = "archive"
 
     def __init__(self, path: Path, dedup_window_seconds: float | None = None) -> None:
         self.path = path
@@ -98,12 +99,42 @@ class MeasurementLog:
         )
         self._load_seen()
 
+    def archive_paths(self) -> list[Path]:
+        archive_dir = self.path.parent / self.ARCHIVE_DIRNAME
+        if not archive_dir.exists():
+            return []
+        return sorted(archive_dir.glob("shadow_onchain-*.jsonl.gz"))
+
     def _load_seen(self) -> None:
+        cutoff = datetime.now(UTC).timestamp() - self.dedup_window_seconds
+        # Rotated segments first so a worker restart after cleanup still
+        # reconstructs the 48h dedup window.
+        for path in self.archive_paths():
+            for row in self._iter_gzip_rows(path, cutoff):
+                self._index_row(row)
         if not self.path.exists():
             return
-        cutoff = datetime.now(UTC).timestamp() - self.dedup_window_seconds
         for row in self._iter_recent_rows(cutoff):
             self._index_row(row)
+
+    def _iter_gzip_rows(self, path: Path, cutoff: float) -> Iterable[dict[str, Any]]:
+        try:
+            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(row, dict):
+                        continue
+                    ts = parse_epoch(row.get("ts"))
+                    if ts is not None and ts < cutoff:
+                        continue
+                    yield row
+        except OSError:
+            return
 
     def _iter_recent_rows(self, cutoff: float) -> Iterable[dict[str, Any]]:
         """Yield rows newer than cutoff, reading the append-only log tail-first.

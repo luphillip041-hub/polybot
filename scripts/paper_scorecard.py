@@ -113,6 +113,12 @@ def window_stats(rows: list[dict]) -> dict:
 
     scored = sum(1 for r in entries if r.get("quality_score") is not None)
 
+    from polymarket_bot.scorecard_slices import classify_closed, slice_pnl
+
+    slices = classify_closed(rows)
+    both_stats = slice_pnl(slices["both_sided_closed"])
+    deduped_stats = slice_pnl(slices["single_sided_closed"])
+
     return {
         "signals": len(signals),
         "entries": len(entries),
@@ -135,6 +141,17 @@ def window_stats(rows: list[dict]) -> dict:
         "stale_live_pct_of_signals": pct(stale_live, n_signals),
         "entries_with_quality_score_pct": pct(scored, len(entries)),
         "fill_checks": check_offsets,
+        # One-market-once view: drop condition_ids where we held both legs.
+        "both_sided_markets": slices["both_sided_markets"],
+        "both_sided_closed": both_stats["closed"],
+        "both_sided_pnl": both_stats["pnl"],
+        "both_sided_win_rate_pct": both_stats["win_rate_pct"],
+        "deduped_markets": slices["single_sided_markets"],
+        "deduped_closed": deduped_stats["closed"],
+        "deduped_wins": deduped_stats["wins"],
+        "deduped_losses": deduped_stats["losses"],
+        "deduped_win_rate_pct": deduped_stats["win_rate_pct"],
+        "deduped_pnl": deduped_stats["pnl"],
     }
 
 
@@ -199,6 +216,13 @@ def render_text(day: str, day_stats: dict, alltime: dict, bar_rows: list[dict]) 
             f"p50={alltime['latency_p50_s']}s p90={alltime['latency_p90_s']}s "
             f"stale_live={alltime['stale_live']}({alltime['stale_live_pct_of_signals']}%) "
             f"stale_recovery={alltime['stale_recovery']} blind_ws={alltime['blind_ws_stale']}"
+        ),
+        (
+            f"DEDUPED markets={alltime['deduped_markets']} closed={alltime['deduped_closed']} "
+            f"W/L={alltime['deduped_wins']}/{alltime['deduped_losses']} "
+            f"WR={alltime['deduped_win_rate_pct']}% PnL=${alltime['deduped_pnl']} "
+            f"(excluded both-sided markets={alltime['both_sided_markets']} "
+            f"closed={alltime['both_sided_closed']} pnl=${alltime['both_sided_pnl']})"
         ),
     ]
     for off, fc in sorted(alltime["fill_checks"].items()):
