@@ -16,7 +16,7 @@ from typing import Any
 
 from .archive_config import ArchiveConfig
 from .book_archive import bbo_from_levels, normalize_levels, trade_id
-from .config import BotConfig, CONFIG
+from .config import BotConfig, CONFIG, env_bool, env_float
 from .alerts import send_telegram
 from .resolution import TokenMap, resolved_outcome_for_token as _onchain_resolved_outcome_for_token, RpcClient
 
@@ -41,7 +41,23 @@ class PaperConfig:
     max_signals_per_day: int = int(os.getenv("PAPER_MAX_SIGNALS_PER_DAY", "60"))
     max_open_positions: int = int(os.getenv("PAPER_MAX_OPEN_POSITIONS", "150"))
     max_spread: float = 0.04
-    min_top3_liquidity_multiple: float = 2.0
+    min_top3_liquidity_multiple: float = field(
+        default_factory=lambda: env_float("PAPER_MIN_TOP3_LIQUIDITY_MULTIPLE", 2.0)
+    )
+    # TOB depth must cover stake by this multiple (default 1.0). Combined
+    # with cap_fill_at_tob this is what closes the cheap-bucket walk-past-TOB
+    # leak: top-3 notional can look fine while the best level cannot fill.
+    min_tob_liquidity_multiple: float = field(
+        default_factory=lambda: env_float("PAPER_MIN_TOB_LIQUIDITY_MULTIPLE", 1.0)
+    )
+    cap_fill_at_tob: bool = field(
+        default_factory=lambda: env_bool("PAPER_CAP_FILL_AT_TOB", True)
+    )
+    # Default-on for paper: holding both legs of one condition_id is a
+    # mechanical pair, not a directional bet. Disable with PAPER_BLOCK_OPPOSITE_LEG=false.
+    block_opposite_leg: bool = field(
+        default_factory=lambda: env_bool("PAPER_BLOCK_OPPOSITE_LEG", True)
+    )
     stale_fill_seconds: float = field(
         default_factory=lambda: float(os.getenv("STALE_FILL_SECONDS", "120"))
     )
@@ -293,10 +309,47 @@ def top3_notional(book: dict[str, Any], side: str) -> float:
     return sum(level["price"] * level["size"] for level in book_levels(book, side))
 
 
-def simulate_fill(book: dict[str, Any], side: str, stake_usd: float, haircut: float = 0.005) -> tuple[float | None, float, str | None]:
+def _level_fill_px(level: dict[str, float], side: str, haircut: float) -> float:
+    px = level["price"] + haircut if side == "BUY" else level["price"] - haircut
+    return min(0.999, max(0.001, px))
+
+
+def tob_notional(book: dict[str, Any], side: str) -> float:
+    """Raw top-of-book notional (price * size of the best level only)."""
+    levels = book_levels(book, side)
+    if not levels:
+        return 0.0
+    return levels[0]["price"] * levels[0]["size"]
+
+
+def tob_fill_notional(book: dict[str, Any], side: str, haircut: float = 0.0) -> float:
+    """Haircuted TOB notional — matches what simulate_fill can spend at the best level."""
+    levels = book_levels(book, side)
+    if not levels:
+        return 0.0
+    return _level_fill_px(levels[0], side, haircut) * levels[0]["size"]
+
+
+def simulate_fill(
+    book: dict[str, Any],
+    side: str,
+    stake_usd: float,
+    haircut: float = 0.005,
+    *,
+    max_levels: int | None = 1,
+) -> tuple[float | None, float, str | None]:
+    """Walk recorded book depth to fill ``stake_usd``.
+
+    ``max_levels`` defaults to 1 (top of book only).  Cheap-bucket entries
+    previously walked into unverified tail levels; that was 38% of sub-20¢
+    fills in the 2026-09 pack.  Pass ``max_levels=None`` to restore the
+    old top-3 walk (tests / explicit opt-out only).
+    """
     levels = book_levels(book, side)
     if not levels:
         return None, 0.0, "missing_book"
+    if max_levels is not None:
+        levels = levels[: max(1, int(max_levels))]
     remaining = stake_usd
     shares = 0.0
     spent = 0.0
@@ -481,6 +534,8 @@ def iter_new_onchain_fills(path: Path, offset: int = 0) -> tuple[list[dict[str, 
         # replay the entire historical measurement log when it reappears.
         return [], offset
     size = path.stat().st_size
+    # Rotation (cleanup) replaces the live file with a new empty one.
+    # An offset past EOF must reset — never replay the archived prefix.
     if offset < 0 or offset > size:
         offset = 0
     fills: list[dict[str, Any]] = []
@@ -675,6 +730,45 @@ def position_key(wallet: str, token: str) -> str:
     return f"{wallet.lower()}:{token}"
 
 
+def fill_condition_id(row: dict[str, Any]) -> str:
+    """Extract a condition_id from a fill / signal row if one is present.
+
+    Only 0x-prefixed hashes pair reliably across YES/NO tokens.  Slugs and
+    question strings are ignored so the opposite-leg gate fails open rather
+    than false-positive on unrelated markets.
+    """
+    trade = row.get("trade") if isinstance(row.get("trade"), dict) else {}
+    book = row.get("book_at_detection") if isinstance(row.get("book_at_detection"), dict) else {}
+    market = book.get("market") if isinstance(book.get("market"), dict) else {}
+    raw = (
+        trade.get("conditionId")
+        or trade.get("condition_id")
+        or market.get("condition_id")
+        or market.get("conditionId")
+        or row.get("condition_id")
+        or ""
+    )
+    value = str(raw or "").strip().lower()
+    return value if value.startswith("0x") else ""
+
+
+def opposite_leg_open(state: dict[str, Any], condition_id: str, token: str) -> bool:
+    """True when paper already holds a different token on the same condition_id."""
+    cid = str(condition_id or "").strip().lower()
+    token = str(token or "")
+    if not cid or not token:
+        return False
+    positions = state.get("positions") if isinstance(state.get("positions"), dict) else {}
+    for pos in positions.values():
+        if not isinstance(pos, dict):
+            continue
+        pos_cid = str(pos.get("condition_id") or "").strip().lower()
+        pos_token = str(pos.get("token") or "")
+        if pos_cid and pos_cid == cid and pos_token and pos_token != token:
+            return True
+    return False
+
+
 def market_resolution_soon(book: dict[str, Any], now: datetime) -> bool:
     market = book.get("market") if isinstance(book.get("market"), dict) else {}
     for key in ("end_date", "endDate", "end_ts", "resolution_ts"):
@@ -749,7 +843,14 @@ def reject_reasons(
     # fill_price = row.get("fill_price")
     # if side == "BUY" and fill_price is not None and num(fill_price) < 0.10:
     #     reasons.append("lottery_price_band")
-    if top3_notional(book, side if side in {"BUY", "SELL"} else "BUY") < cfg.stake_usd * cfg.min_top3_liquidity_multiple:
+    gate_side = side if side in {"BUY", "SELL"} else "BUY"
+    thin_top3 = top3_notional(book, gate_side) < cfg.stake_usd * cfg.min_top3_liquidity_multiple
+    thin_tob = (
+        cfg.min_tob_liquidity_multiple > 0
+        and tob_fill_notional(book, gate_side, cfg.haircut)
+        < cfg.stake_usd * cfg.min_tob_liquidity_multiple
+    )
+    if thin_top3 or thin_tob:
         reasons.append("illiquid_depth")
     if market_resolution_soon(book, detect_ts):
         reasons.append("near_resolution")
@@ -762,6 +863,12 @@ def reject_reasons(
     token = str((row.get("trade") or {}).get("asset") or book.get("token_id") or "")
     if side == "BUY" and position_key(wallet, token) in state.get("positions", {}):
         reasons.append("duplicate")
+    if (
+        side == "BUY"
+        and cfg.block_opposite_leg
+        and opposite_leg_open(state, fill_condition_id(row), token)
+    ):
+        reasons.append("opposite_leg")
     if side == "BUY" and len(state.get("positions", {})) >= cfg.max_open_positions:
         reasons.append("max_positions")
     if side == "SELL" and position_key(wallet, token) not in state.get("positions", {}):
@@ -1064,14 +1171,40 @@ class PaperFollowerDaemon:
                 rej = dict(out[0]); rej.update({"ts": iso_now(), "type": "reject", "reject_reason": "score_below_ratchet", "book_snapshot": snap})
                 out.append(rej)
             else:
-                price, shares, fill_err = simulate_fill(book, "BUY", self.cfg.stake_usd, self.cfg.haircut)
+                price, shares, fill_err = simulate_fill(
+                    book,
+                    "BUY",
+                    self.cfg.stake_usd,
+                    self.cfg.haircut,
+                    max_levels=1 if self.cfg.cap_fill_at_tob else None,
+                )
                 if fill_err:
                     ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "reject", "reject_reason": fill_err, "book_snapshot": snap})
                     out.append(ent)
                 else:
                     pos_id = position_key(wallet, token)
-                    self.state.setdefault("positions", {})[pos_id] = {"position_id": pos_id, "wallet": wallet, "token": token, "entry_price": price, "shares": shares, "cost_usd": self.cfg.stake_usd, "opened_at": iso_now(), "quarantined_low_price": quarantined_low_price}
-                    ent = dict(out[0]); ent.update({"ts": iso_now(), "type": "entry", "sim_fill_price": price, "sim_size": shares, "position_id": pos_id, "book_snapshot": snap, "quarantined_low_price": quarantined_low_price})
+                    condition_id = fill_condition_id(row)
+                    self.state.setdefault("positions", {})[pos_id] = {
+                        "position_id": pos_id,
+                        "wallet": wallet,
+                        "token": token,
+                        "condition_id": condition_id,
+                        "entry_price": price,
+                        "shares": shares,
+                        "cost_usd": self.cfg.stake_usd,
+                        "opened_at": iso_now(),
+                        "quarantined_low_price": quarantined_low_price,
+                    }
+                    ent = dict(out[0]); ent.update({
+                        "ts": iso_now(),
+                        "type": "entry",
+                        "sim_fill_price": price,
+                        "sim_size": shares,
+                        "position_id": pos_id,
+                        "condition_id": condition_id,
+                        "book_snapshot": snap,
+                        "quarantined_low_price": quarantined_low_price,
+                    })
                     out.append(ent)
                     self._fill_shadow.schedule(ent)
                     if self._executor is not None:
@@ -1513,6 +1646,7 @@ def apply_resolution(state: dict[str, Any], action: dict[str, Any]) -> dict[str,
         "wallet": pos.get("wallet"),
         "market": action.get("question") or "resolved",
         "token": pos.get("token"),
+        "condition_id": pos.get("condition_id"),
         "side": "BUY",  # paper follower is long-only
         "detection_latency_s": None,
         "wallet_fill_price": entry_price,

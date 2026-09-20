@@ -113,6 +113,12 @@ def window_stats(rows: list[dict]) -> dict:
 
     scored = sum(1 for r in entries if r.get("quality_score") is not None)
 
+    from polymarket_bot.scorecard_slices import classify_closed, slice_pnl
+
+    slices = classify_closed(rows)
+    both_stats = slice_pnl(slices["both_sided_closed"])
+    deduped_stats = slice_pnl(slices["single_sided_closed"])
+
     return {
         "signals": len(signals),
         "entries": len(entries),
@@ -135,6 +141,17 @@ def window_stats(rows: list[dict]) -> dict:
         "stale_live_pct_of_signals": pct(stale_live, n_signals),
         "entries_with_quality_score_pct": pct(scored, len(entries)),
         "fill_checks": check_offsets,
+        # One-market-once view: drop condition_ids where we held both legs.
+        "both_sided_markets": slices["both_sided_markets"],
+        "both_sided_closed": both_stats["closed"],
+        "both_sided_pnl": both_stats["pnl"],
+        "both_sided_win_rate_pct": both_stats["win_rate_pct"],
+        "deduped_markets": slices["single_sided_markets"],
+        "deduped_closed": deduped_stats["closed"],
+        "deduped_wins": deduped_stats["wins"],
+        "deduped_losses": deduped_stats["losses"],
+        "deduped_win_rate_pct": deduped_stats["win_rate_pct"],
+        "deduped_pnl": deduped_stats["pnl"],
     }
 
 
@@ -200,6 +217,13 @@ def render_text(day: str, day_stats: dict, alltime: dict, bar_rows: list[dict]) 
             f"stale_live={alltime['stale_live']}({alltime['stale_live_pct_of_signals']}%) "
             f"stale_recovery={alltime['stale_recovery']} blind_ws={alltime['blind_ws_stale']}"
         ),
+        (
+            f"DEDUPED markets={alltime['deduped_markets']} closed={alltime['deduped_closed']} "
+            f"W/L={alltime['deduped_wins']}/{alltime['deduped_losses']} "
+            f"WR={alltime['deduped_win_rate_pct']}% PnL=${alltime['deduped_pnl']} "
+            f"(excluded both-sided markets={alltime['both_sided_markets']} "
+            f"closed={alltime['both_sided_closed']} pnl=${alltime['both_sided_pnl']})"
+        ),
     ]
     for off, fc in sorted(alltime["fill_checks"].items()):
         lines.append(
@@ -222,6 +246,10 @@ def main() -> int:
     parser.add_argument("--date", help="UTC day YYYY-MM-DD (default: yesterday)")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--ledger", default=str(LEDGER))
+    parser.add_argument(
+        "--timing-json",
+        help="JSON from scripts/analyze_entry_timing.py (adds TIMING line; no Gamma fetch here)",
+    )
     args = parser.parse_args()
 
     import datetime as dt
@@ -253,15 +281,24 @@ def main() -> int:
     recent_stats = window_stats(recent_rows)
     bar_rows = bars(alltime, recent_stats)
 
+    timing_line = None
+    timing_payload = None
+    if args.timing_json:
+        from polymarket_bot.scorecard_slices import timing_line_from_analysis
+
+        timing_payload = json.loads(Path(args.timing_json).read_text())
+        timing_line = timing_line_from_analysis(timing_payload)
+
     if args.json:
-        print(
-            json.dumps(
-                {"day": day, "day_stats": day_stats, "alltime": alltime, "bars": bar_rows},
-                indent=1,
-            )
-        )
+        out = {"day": day, "day_stats": day_stats, "alltime": alltime, "bars": bar_rows}
+        if timing_payload is not None:
+            out["timing"] = timing_payload.get("summary") if isinstance(timing_payload, dict) else timing_payload
+        print(json.dumps(out, indent=1))
     else:
-        print(render_text(day, day_stats, alltime, bar_rows))
+        text = render_text(day, day_stats, alltime, bar_rows)
+        if timing_line:
+            text = text + "\n" + timing_line
+        print(text)
     return 0
 
 

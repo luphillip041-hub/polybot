@@ -11,6 +11,9 @@ with resolution rows by token ID, and produces:
 Usage:
     python scripts/analyze_settlement.py
 
+Entry vs real-world outcome timing is a separate check:
+    python scripts/analyze_entry_timing.py --ledger runs/paper/ledger.jsonl
+
 Output:
     prints tables + writes runs/paper/analysis_settlement_1.json
 """

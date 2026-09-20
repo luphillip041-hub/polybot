@@ -220,6 +220,49 @@ class CleanupTest(unittest.TestCase):
         self.assertIn("duration_s", d)
         self.assertIn("total_before_mb", d)
 
+    def test_rotates_onchain_shadow_jsonl(self):
+        shadow_dir = self.runs_dir / "onchain_shadow"
+        shadow_dir.mkdir()
+        live = shadow_dir / "shadow_onchain.jsonl"
+        rows = [{"i": i, "type": "lane_detection"} for i in range(40)]
+        with open(live, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        original = self.cleanup.ONCHAIN_SHADOW_ROTATE_BYTES
+        self.cleanup.ONCHAIN_SHADOW_ROTATE_BYTES = 64
+        try:
+            result = self.cleanup.run_cleanup(
+                runs_dir=self.runs_dir,
+                book_retention_days=999,
+                shadow_retention_days=999,
+                max_gb=10.0,
+                dry_run=False,
+            )
+        finally:
+            self.cleanup.ONCHAIN_SHADOW_ROTATE_BYTES = original
+        self.assertTrue(result.onchain_shadow_rotated)
+        self.assertFalse(live.exists())
+        segments = list((shadow_dir / "archive").glob("shadow_onchain-*.jsonl.gz"))
+        self.assertEqual(len(segments), 1)
+        with gzip.open(segments[0], "rt") as f:
+            archived = [json.loads(line) for line in f if line.strip()]
+        self.assertEqual(archived, rows)
+
+    def test_onchain_shadow_below_threshold_is_noop(self):
+        shadow_dir = self.runs_dir / "onchain_shadow"
+        shadow_dir.mkdir()
+        live = shadow_dir / "shadow_onchain.jsonl"
+        live.write_text("{}\n")
+        result = self.cleanup.run_cleanup(
+            runs_dir=self.runs_dir,
+            book_retention_days=999,
+            shadow_retention_days=999,
+            max_gb=10.0,
+            dry_run=False,
+        )
+        self.assertFalse(result.onchain_shadow_rotated)
+        self.assertTrue(live.exists())
+
     def test_handles_missing_runs_dir(self):
         import shutil
         shutil.rmtree(self.runs_dir)

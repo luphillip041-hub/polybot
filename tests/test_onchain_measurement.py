@@ -36,6 +36,27 @@ def test_measurement_log_is_append_only_and_reloads_seen_ids(tmp_path: Path) -> 
     assert reloaded.seen_onchain_event_ids == {"0x1:2"}
 
 
+def test_measurement_log_reloads_seen_ids_from_rotated_archive(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    live = tmp_path / "shadow_onchain.jsonl"
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    ts = datetime.now(UTC).isoformat(timespec="seconds")
+    archived = {
+        "ts": ts,
+        "type": "lane_detection",
+        "source": "polygon_onchain",
+        "durable_trade_id": "0xrot:1",
+    }
+    with gzip.open(archive / "shadow_onchain-20260919-000000-000001.jsonl.gz", "wt") as handle:
+        handle.write(json.dumps(archived) + "\n")
+    live.write_text("")
+    reloaded = MeasurementLog(live)
+    assert ("polygon_onchain", "0xrot:1") in reloaded.seen_lane_ids
+    assert "0xrot:1" in reloaded.seen_onchain_event_ids
+
+
 def test_api_shadow_reader_tags_existing_collector_without_writing_it(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     archive.mkdir()
